@@ -53,6 +53,16 @@ class _FakeTarget:
             embed_tokens=_FakeEmbed(),
         )
 
+class _WrongOuterEmbed:
+    def as_linear(self, hidden: mx.array) -> mx.array:
+        del hidden
+        return mx.array([[[1.0, 0.0]]])
+
+class _RealQwenLmHead:
+    def __call__(self, hidden: mx.array) -> mx.array:
+        del hidden
+        return mx.array([[[0.0, 1.0]]])
+
 def _fake_qwen_full_attention(*, q_heads: int = 4, kv_heads: int = 1, head_dim: int = 256):
     class _Proj:
         def __init__(self, out_dim: int) -> None:
@@ -261,6 +271,31 @@ def test_resolver_rejects_empty_model_type_even_with_qwen_like_shape():
     else:
         raise AssertionError("empty model_type must not resolve to Qwen ops")
 
+def test_qwen_text_wrapper_prefers_language_model_over_outer_model():
+    real_text_wrapper = SimpleNamespace(
+        args=SimpleNamespace(tie_word_embeddings=False),
+        model=SimpleNamespace(layers=[_FakeFaLayer()], embed_tokens=_FakeEmbed()),
+        lm_head=_RealQwenLmHead(),
+    )
+    outer_wrapper = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[_FakeFaLayer()],
+            embed_tokens=_WrongOuterEmbed(),
+        ),
+        language_model=real_text_wrapper,
+    )
+
+    ops = QwenGdnTargetOps()
+    hidden = mx.zeros((1, 1, 1))
+    logits = ops.logits_from_hidden(outer_wrapper, hidden)
+    expected = real_text_wrapper.lm_head(hidden)
+    mx.eval(logits, expected)
+
+    assert ops.text_wrapper(outer_wrapper) is real_text_wrapper
+    assert int(mx.argmax(logits[:, -1, :], axis=-1).item()) == int(
+        mx.argmax(expected[:, -1, :], axis=-1).item()
+    )
+
 def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     ops = QwenGdnTargetOps()
 
@@ -271,6 +306,8 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert hybrid.supports_dflash is True
     assert hybrid.supports_prefix_snapshot is True
     assert hybrid.supports_tree_verify is True
+    assert hybrid.supports_full_context_draft_layers is True
+    assert pure.supports_full_context_draft_layers is True
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True
@@ -295,6 +332,45 @@ def test_qwen_verify_gqa_route_is_internal_default(monkeypatch):
 
     assert calls == [(4, 4, 256)]
     assert attn.original_calls == 0
+
+
+def test_qwen_dflash2_block5_uses_native_gqa_at_long_kv(monkeypatch):
+    routes: list[str] = []
+
+    def _native(queries, keys, values, *, cache, scale, mask):
+        del keys, values, cache, scale, mask
+        routes.append("native")
+        return mx.zeros_like(queries)
+
+    def _grouped(queries, keys, values, *, cache, scale, mask):
+        del keys, values, cache, scale, mask
+        routes.append("grouped")
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(qwen_gdn, "scaled_dot_product_attention", _native)
+    monkeypatch.setattr(qwen_gdn, "grouped_gqa_sdpa", _grouped)
+
+    queries = mx.zeros((1, 4, 5, 256), dtype=mx.bfloat16)
+    short_kv = mx.zeros((1, 1, 8191, 256), dtype=mx.bfloat16)
+    long_kv = mx.zeros((1, 1, 8192, 256), dtype=mx.bfloat16)
+
+    qwen_gdn._gqa_reshape_sdpa(
+        queries,
+        short_kv,
+        short_kv,
+        scale=1.0,
+        mask=None,
+    )
+    qwen_gdn._gqa_reshape_sdpa(
+        queries,
+        long_kv,
+        long_kv,
+        scale=1.0,
+        mask=None,
+    )
+
+    assert routes == ["grouped", "native"]
+
 
 def test_qwen_prefill_uses_original_attention(monkeypatch):
     attn, cache = _fake_qwen_full_attention()
@@ -510,7 +586,7 @@ def test_gemma4_full_attention_gqa_hook_is_internal():
     full_attn = model.model.layers[1].self_attn
     assert not hasattr(sliding_attn, "_dflash_split_sdpa_enabled")
     assert not hasattr(full_attn, "_dflash_split_sdpa_enabled")
-    assert getattr(type(full_attn), "_dflash_full_attention_gqa_installed") is True
+    assert getattr(type(full_attn), "_dflash_full_attention_gqa_installed") == "gemma4"
 
 def test_gemma4_logits_use_tied_embedding_head():
     target = _FakeGemmaLogitTarget(tied=True)

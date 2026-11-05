@@ -17,6 +17,7 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 
+from dflash_mlx.engine._hook_guard import claim_class_hook
 from dflash_mlx.engine.gqa_sdpa import (
     async_per_head_gqa_sdpa,
     grouped_gqa_sdpa,
@@ -115,12 +116,16 @@ def _gqa_reshape_sdpa(
             mask=mask,
         )
 
-    use_native_gqa = (q_len_i == 1 and kv_len_i >= 4096) or (
-        q_len_i == 4
-        and (
-            kv_len_i <= 8192
-            or (int(gqa) <= 4 and kv_len_i <= 32768)
-            or (kv_heads_i >= 4 and kv_len_i <= 16384)
+    use_native_gqa = (
+        (q_len_i == 1 and kv_len_i >= 4096)
+        or (q_len_i == 5 and kv_len_i >= 8192)
+        or (
+            q_len_i == 4
+            and (
+                kv_len_i <= 8192
+                or (int(gqa) <= 4 and kv_len_i <= 32768)
+                or (kv_heads_i >= 4 and kv_len_i <= 16384)
+            )
         )
     )
     if use_native_gqa:
@@ -543,7 +548,7 @@ def _commit_recurrent_tree_path(
 
 def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls = type(linear_attn)
-    if getattr(cls, "_dflash_speculative_call_installed", False):
+    if not claim_class_hook(cls, "_dflash_speculative_call_installed", "qwen_gdn"):
         return
 
     original_call = cls.__call__
@@ -651,11 +656,11 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         return out
 
     cls.__call__ = speculative_call
-    cls._dflash_speculative_call_installed = True
+    cls._dflash_speculative_call_installed = "qwen_gdn"
 
 def _install_full_attention_gqa_hook(attn: Any) -> None:
     cls = type(attn)
-    if getattr(cls, "_dflash_full_attention_gqa_installed", False):
+    if not claim_class_hook(cls, "_dflash_full_attention_gqa_installed", "qwen_gdn"):
         return
 
     original_call = cls.__call__
@@ -725,7 +730,7 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         return self.o_proj(gated_output)
 
     cls.__call__ = attention_call
-    cls._dflash_full_attention_gqa_installed = True
+    cls._dflash_full_attention_gqa_installed = "qwen_gdn"
 
 class QwenGdnTargetOps:
     backend_name = "qwen_gdn"
@@ -756,10 +761,11 @@ class QwenGdnTargetOps:
         return hasattr(inner, "layers") and hasattr(inner, "embed_tokens")
 
     def text_wrapper(self, target_model: Any) -> Any:
+        language_model = getattr(target_model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "model"):
+            return language_model
         if hasattr(target_model, "model"):
             return target_model
-        if hasattr(target_model, "language_model"):
-            return target_model.language_model
         raise AttributeError(f"Unsupported target model wrapper: {type(target_model)!r}")
 
     def text_model(self, target_model: Any) -> Any:
@@ -797,6 +803,7 @@ class QwenGdnTargetOps:
             supports_target_hidden_capture=True,
             supports_verify_linear=self._supports_verify_linear(target_model),
             supports_tree_verify=True,
+            supports_full_context_draft_layers=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:

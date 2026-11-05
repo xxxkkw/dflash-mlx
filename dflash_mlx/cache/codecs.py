@@ -11,8 +11,13 @@ import mlx.core as mx
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
-from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot, FAState
+from dflash_mlx.cache.snapshot import (
+    DFlashPrefixSnapshot,
+    FAState,
+    TargetHiddenChunks,
+)
 from dflash_mlx.engine.config import _effective_draft_window_size
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 def _clone_array(a: Optional[mx.array]) -> Optional[mx.array]:
@@ -40,14 +45,14 @@ def _resolve_effective_trim_window(
         context_len=int(total_len),
         allow_full_attention_context=allow_full_attention_context,
     )
-    if _requires_full_target_hidden(
+    if requires_full_target_hidden(
         draft_model,
         allow_full_attention_context=allow_full_attention_context,
     ):
         effective = max(effective, int(total_len))
     return max(0, int(sink)), max(0, int(effective))
 
-def _requires_full_target_hidden(
+def requires_full_target_hidden(
     draft_model: Any,
     *,
     allow_full_attention_context: bool,
@@ -58,18 +63,30 @@ def _requires_full_target_hidden(
     layer_types = tuple(str(kind) for kind in (getattr(args, "layer_types", ()) or ()))
     return any(kind == "full_attention" for kind in layer_types)
 
+def _target_hidden_slice(
+    target_hidden: mx.array | TargetHiddenChunks,
+    start: int,
+    end: int,
+) -> mx.array:
+    if isinstance(target_hidden, TargetHiddenChunks):
+        return target_hidden.slice(start, end)
+    return target_hidden[:, start:end, :]
+
 def _build_target_hidden_chunks(
-    target_hidden: mx.array,
+    target_hidden: mx.array | TargetHiddenChunks,
     *,
     draft_model: Optional[Any] = None,
     trim_target_hidden: bool = True,
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
+    clone: bool = True,
+    cover_boundary: int = 0,
 ) -> tuple[tuple[mx.array, ...], tuple[tuple[int, int], ...], int]:
+    grab = _clone_array if clone else (lambda a: a)
     total_len = int(target_hidden.shape[1])
     if not trim_target_hidden:
-        full = _clone_array(target_hidden)
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
     sink, window = _resolve_effective_trim_window(
@@ -80,30 +97,152 @@ def _build_target_hidden_chunks(
         allow_full_attention_context=allow_full_attention_context,
     )
     if total_len <= sink + window or sink + window == 0:
-        full = _clone_array(target_hidden)
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
-    sink_chunk = _clone_array(target_hidden[:, :sink, :])
-    tail_chunk = _clone_array(target_hidden[:, total_len - window :, :])
-    assert sink_chunk is not None and tail_chunk is not None
+    tail_start = total_len - window
+    if cover_boundary > 0:
+        tail_start = min(tail_start, max(0, int(cover_boundary) - window))
+    if tail_start <= sink:
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
+        assert full is not None
+        return (full,), ((0, total_len),), total_len
+    tail_chunk = grab(_target_hidden_slice(target_hidden, tail_start, total_len))
+    assert tail_chunk is not None
+    if sink == 0:
+        return (tail_chunk,), ((tail_start, total_len),), total_len
+    sink_chunk = grab(_target_hidden_slice(target_hidden, 0, sink))
+    assert sink_chunk is not None
     return (
         (sink_chunk, tail_chunk),
-        ((0, sink), (total_len - window, total_len)),
+        ((0, sink), (tail_start, total_len)),
         total_len,
+    )
+
+def sidecar_eligible(target_cache: list[Any]) -> bool:
+    return all(
+        isinstance(entry, (KVCache, RecurrentRollbackCache))
+        and not isinstance(entry, RotatingKVCache)
+        for entry in target_cache
+    )
+
+def capture_gdn_sidecar(
+    target_cache: list[Any],
+) -> tuple[Optional[tuple[Optional[mx.array], ...]], ...]:
+    return tuple(
+        tuple(entry.cache) if isinstance(entry, RecurrentRollbackCache) else None
+        for entry in target_cache
+    )
+
+
+def snapshot_covers_sidecar_context(
+    snapshot: DFlashPrefixSnapshot,
+    boundary: int,
+    *,
+    require_full_coverage: bool,
+) -> bool:
+    boundary = int(boundary)
+    if require_full_coverage:
+        return snapshot_covers_prefix(snapshot, boundary)
+
+    spans = tuple(snapshot.target_hidden_chunk_spans)
+    sink_end = min(boundary, max(0, int(snapshot.key.draft_sink_size)))
+    if sink_end > 0 and not _spans_cover_interval(spans, 0, sink_end):
+        return False
+    window = max(1, int(snapshot.key.draft_window_size))
+    tail_start = max(sink_end, boundary - window)
+    return _spans_cover_interval(spans, tail_start, boundary)
+
+
+def _spans_cover_interval(
+    spans: tuple[tuple[int, int], ...],
+    start: int,
+    end: int,
+) -> bool:
+    covered = int(start)
+    for span_start, span_end in spans:
+        span_start = int(span_start)
+        span_end = int(span_end)
+        if span_end <= covered:
+            continue
+        if span_start > covered:
+            return False
+        covered = max(covered, span_end)
+        if covered >= int(end):
+            return True
+    return covered >= int(end)
+
+
+def slice_snapshot_at_sidecar_boundary(
+    snapshot: DFlashPrefixSnapshot,
+    *,
+    require_full_coverage: bool = False,
+) -> DFlashPrefixSnapshot:
+    boundary = int(snapshot.sidecar_boundary)
+    if not 0 < boundary < snapshot.prefix_len:
+        raise ValueError(
+            f"Sidecar boundary {boundary} outside (0, {snapshot.prefix_len})"
+        )
+    if snapshot.sidecar_gdn_states is None or snapshot.sidecar_last_logits is None:
+        raise ValueError("Snapshot has a sidecar boundary but no sidecar states")
+    if not snapshot_covers_sidecar_context(
+        snapshot,
+        boundary,
+        require_full_coverage=require_full_coverage,
+    ):
+        raise ValueError(
+            f"Snapshot feature spans do not cover sidecar context at {boundary}"
+        )
+    fa: list[Optional[FAState]] = []
+    for layer_idx, state in enumerate(snapshot.fa_states):
+        if state is None:
+            fa.append(None)
+            continue
+        if len(state) != 3:
+            raise ValueError(
+                f"FA state at layer {layer_idx} is not boundary-sliceable"
+            )
+        k, v, _offset = state
+        fa.append((k[:, :, :boundary, :], v[:, :, :boundary, :], boundary))
+    chunks: list[mx.array] = []
+    spans: list[tuple[int, int]] = []
+    for chunk, (start, end) in zip(
+        snapshot.target_hidden_chunks,
+        snapshot.target_hidden_chunk_spans,
+    ):
+        if start >= boundary:
+            continue
+        keep = min(end, boundary) - start
+        chunks.append(chunk[:, :keep, :])
+        spans.append((start, start + keep))
+    return DFlashPrefixSnapshot(
+        token_ids=snapshot.token_ids[:boundary],
+        fa_states=tuple(fa),
+        gdn_states=snapshot.sidecar_gdn_states,
+        target_hidden_chunks=tuple(chunks),
+        target_hidden_chunk_spans=tuple(spans),
+        target_hidden_total_len=boundary,
+        last_logits=snapshot.sidecar_last_logits,
+        key=snapshot.key,
+        kind="prefill",
+        created_at=snapshot.created_at,
     )
 
 def serialize_target_cache(
     target_cache: list[Any],
+    *,
+    clone: bool = True,
 ) -> tuple[
     tuple[Optional[FAState], ...],
     tuple[Optional[tuple[Optional[mx.array], ...]], ...],
 ]:
+    grab = _clone_array if clone else (lambda a: a)
     fa: list[Optional[FAState]] = []
     gdn: list[Optional[tuple[Optional[mx.array], ...]]] = []
     for layer_idx, entry in enumerate(target_cache):
         if isinstance(entry, RecurrentRollbackCache):
             fa.append(None)
-            gdn.append(tuple(_clone_array(a) for a in entry.cache))
+            gdn.append(tuple(grab(a) for a in entry.cache))
         elif isinstance(entry, RotatingKVCache):
             keys = getattr(entry, "keys", None)
             values = getattr(entry, "values", None)
@@ -113,8 +252,8 @@ def serialize_target_cache(
             else:
                 fa.append(
                     (
-                        _clone_array(keys),
-                        _clone_array(values),
+                        grab(keys),
+                        grab(values),
                         int(entry.offset),
                         int(entry._idx),
                     )
@@ -127,7 +266,7 @@ def serialize_target_cache(
                 gdn.append(None)
             else:
                 k, v = state
-                fa.append((_clone_array(k), _clone_array(v), int(entry.offset)))
+                fa.append((grab(k), grab(v), int(entry.offset)))
                 gdn.append(None)
         else:
             raise TypeError(
@@ -177,15 +316,21 @@ def hydrate_target_cache(
                 size=len(tmpl.cache),
                 conv_kernel_size=tmpl.conv_kernel_size,
             )
-            new_cache.cache = [_clone_array(a) for a in gdn_state]
+            new_cache.cache = list(gdn_state)
             result.append(new_cache)
         elif isinstance(tmpl, KVCache):
             if fa_state is None:
                 raise ValueError(f"Snapshot missing FA state at layer {i}")
             k, v, offset = fa_state[:3]
+            if int(k.shape[2]) != int(offset) or int(v.shape[2]) != int(offset):
+                raise ValueError(
+                    f"Snapshot FA arrays at layer {i} are not exact-length "
+                    f"(keys={int(k.shape[2])}, values={int(v.shape[2])}, "
+                    f"offset={int(offset)}); cannot adopt"
+                )
             new_cache = KVCache()
-            new_cache.keys = _clone_array(k)
-            new_cache.values = _clone_array(v)
+            new_cache.keys = k
+            new_cache.values = v
             new_cache.offset = offset
             result.append(new_cache)
         elif isinstance(tmpl, RotatingKVCache):
@@ -215,7 +360,7 @@ def build_snapshot(
     *,
     token_ids: list[int],
     target_cache: list[Any],
-    target_hidden: mx.array,
+    target_hidden: mx.array | TargetHiddenChunks,
     last_logits: Optional[mx.array],
     key: DFlashPrefixKey,
     kind: str = "prefill",
@@ -224,9 +369,28 @@ def build_snapshot(
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
+    adopt_cache_arrays: bool = False,
+    sidecar_boundary: int = 0,
+    sidecar_gdn_states: Optional[
+        tuple[Optional[tuple[Optional[mx.array], ...]], ...]
+    ] = None,
+    sidecar_last_logits: Optional[mx.array] = None,
 ) -> DFlashPrefixSnapshot:
     token_tuple = tuple(int(t) for t in token_ids)
     prefix_len = len(token_tuple)
+    sidecar_boundary = int(sidecar_boundary)
+    if sidecar_boundary > 0:
+        if kind != "generation":
+            raise ValueError("Sidecar boundary is only valid on generation snapshots")
+        if not sidecar_boundary < prefix_len:
+            raise ValueError(
+                f"Sidecar boundary {sidecar_boundary} must be < prefix length {prefix_len}"
+            )
+        if sidecar_gdn_states is None or sidecar_last_logits is None:
+            raise ValueError("Sidecar boundary requires sidecar states and logits")
+    else:
+        sidecar_gdn_states = None
+        sidecar_last_logits = None
     hidden_len = int(target_hidden.shape[1])
     if hidden_len < prefix_len:
         raise ValueError(
@@ -234,9 +398,32 @@ def build_snapshot(
             f"< token prefix length {prefix_len}"
         )
     if hidden_len > prefix_len:
-        target_hidden = target_hidden[:, :prefix_len, :]
+        if isinstance(target_hidden, TargetHiddenChunks):
+            target_hidden = TargetHiddenChunks(
+                total_len=prefix_len,
+                chunks=tuple(
+                    chunk[:, : max(0, min(end, prefix_len) - start), :]
+                    for chunk, (start, end) in zip(
+                        target_hidden.chunks,
+                        target_hidden.spans,
+                    )
+                    if start < prefix_len
+                ),
+                spans=tuple(
+                    (start, min(end, prefix_len))
+                    for start, end in target_hidden.spans
+                    if start < prefix_len
+                ),
+            )
+        else:
+            target_hidden = target_hidden[:, :prefix_len, :]
 
-    fa, gdn = serialize_target_cache(target_cache)
+    # Adopting is safe: GDN entries are replaced per update, and exact-length
+    # FA arrays force the growth path on the next update.
+    fa, gdn = serialize_target_cache(
+        target_cache,
+        clone=not adopt_cache_arrays,
+    )
     _validate_snapshot_cache_prefix_len(fa, prefix_len=prefix_len)
     chunks, spans, total_len = _build_target_hidden_chunks(
         target_hidden,
@@ -245,8 +432,14 @@ def build_snapshot(
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         allow_full_attention_context=allow_full_attention_context,
+        clone=not adopt_cache_arrays,
+        cover_boundary=sidecar_boundary,
     )
-    cloned_logits = _clone_array(last_logits) if last_logits is not None else None
+    cloned_logits = (
+        last_logits
+        if adopt_cache_arrays
+        else (_clone_array(last_logits) if last_logits is not None else None)
+    )
     return DFlashPrefixSnapshot(
         token_ids=token_tuple,
         fa_states=fa,
@@ -257,6 +450,9 @@ def build_snapshot(
         last_logits=cloned_logits,
         key=key,
         kind=kind,
+        sidecar_boundary=sidecar_boundary,
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
 
 
@@ -272,10 +468,16 @@ class PrefixSnapshotBuilder:
         *,
         token_ids: list[int],
         target_cache: list[Any],
-        target_hidden: mx.array,
+        target_hidden: mx.array | TargetHiddenChunks,
         last_logits: Optional[mx.array],
         kind: str,
         allow_full_attention_context: bool = False,
+        adopt_cache_arrays: bool = False,
+        sidecar_boundary: int = 0,
+        sidecar_gdn_states: Optional[
+            tuple[Optional[tuple[Optional[mx.array], ...]], ...]
+        ] = None,
+        sidecar_last_logits: Optional[mx.array] = None,
     ) -> DFlashPrefixSnapshot:
         return build_snapshot(
             token_ids=token_ids,
@@ -288,4 +490,8 @@ class PrefixSnapshotBuilder:
             draft_sink_size=self.draft_sink_size,
             draft_window_size=self.draft_window_size,
             allow_full_attention_context=allow_full_attention_context,
+            adopt_cache_arrays=adopt_cache_arrays,
+            sidecar_boundary=sidecar_boundary,
+            sidecar_gdn_states=sidecar_gdn_states,
+            sidecar_last_logits=sidecar_last_logits,
         )

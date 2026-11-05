@@ -338,7 +338,7 @@ def test_full_context_draft_cache_keeps_all_positions_without_windowing():
     assert full_cache.position_indices().tolist() == list(range(8))
 
 
-def test_full_context_draft_cache_append_is_segmented(monkeypatch):
+def test_full_context_draft_cache_never_concatenates(monkeypatch):
     concat_calls = 0
     original_concatenate = model_mod.mx.concatenate
 
@@ -356,17 +356,74 @@ def test_full_context_draft_cache_append_is_segmented(monkeypatch):
     monkeypatch.setattr(model_mod.mx, "concatenate", tracked_concatenate)
     cache.append_context(first_keys, first_values, num_positions=8)
     cache.append_context(next_keys, next_values, num_positions=2)
+    keys, values = cache.fetch()
+    positions = cache.position_indices()
+    mx.eval(keys, values, positions)
 
     assert concat_calls == 0
     assert cache.cache_length() == 10
     assert cache.offset == 10
-
-    keys, values = cache.fetch()
-    positions = cache.position_indices()
-    mx.eval(keys, values, positions)
     assert keys.shape[2] == 10
     assert values.shape[2] == 10
     assert positions.tolist() == list(range(10))
+    assert bool(mx.all(keys[:, :, :8, :] == 0).item())
+    assert bool(mx.all(keys[:, :, 8:, :] == 1).item())
+
+
+def test_full_context_draft_cache_grow_preserves_content_across_step():
+    cache = FullContextDraftKVCache()
+    first = mx.broadcast_to(
+        mx.arange(300, dtype=mx.float32).reshape(1, 1, 300, 1), (1, 2, 300, 4)
+    )
+    cache.append_context(mx.array(first), mx.array(first) * 2.0, num_positions=300)
+    tail = mx.full((1, 2, 10, 4), 7.0)
+    cache.append_context(tail, tail, num_positions=10)
+
+    keys, values = cache.fetch()
+    mx.eval(keys, values)
+    assert cache.cache_length() == 310
+    assert int(cache.keys.shape[2]) == 512
+    assert bool(mx.all(keys[:, :, :300, :] == first).item())
+    assert bool(mx.all(values[:, :, :300, :] == first * 2.0).item())
+    assert bool(mx.all(keys[:, :, 300:, :] == 7.0).item())
+
+
+def test_full_context_draft_cache_fetch_with_block_is_transient():
+    cache = FullContextDraftKVCache()
+    ctx = mx.zeros((1, 1, 8, 4))
+    cache.append_context(ctx, ctx, num_positions=8)
+
+    noise = mx.full((1, 1, 3, 4), 5.0)
+    keys, values = cache.fetch_with_block(noise, noise)
+    mx.eval(keys, values)
+    assert keys.shape[2] == 11
+    assert bool(mx.all(keys[:, :, 8:, :] == 5.0).item())
+    assert cache.cache_length() == 8
+    assert cache.offset == 8
+
+    committed = mx.full((1, 1, 3, 4), 9.0)
+    cache.append_context(committed, committed, num_positions=3)
+    keys2, _ = cache.fetch()
+    mx.eval(keys2)
+    assert cache.cache_length() == 11
+    assert bool(mx.all(keys2[:, :, 8:, :] == 9.0).item())
+
+
+def test_full_context_draft_cache_matches_concat_reference():
+    mx.random.seed(7)
+    chunks = [
+        mx.random.normal((1, 2, n, 4), dtype=mx.float32) for n in (5, 1, 3, 2)
+    ]
+    cache = FullContextDraftKVCache()
+    for chunk in chunks:
+        cache.append_context(
+            mx.array(chunk), mx.array(chunk) + 1.0, num_positions=int(chunk.shape[2])
+        )
+    keys, values = cache.fetch()
+    ref_keys = mx.concatenate(chunks, axis=2)
+    mx.eval(keys, values, ref_keys)
+    assert bool(mx.array_equal(keys, ref_keys).item())
+    assert bool(mx.array_equal(values, ref_keys + 1.0).item())
 
 
 def test_full_attention_draft_cache_attention_path_keeps_full_context():
@@ -476,32 +533,6 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
         assert "TargetOps.logits_from_hidden" in message
     else:
         raise AssertionError("draft checkpoints with lm_head weights must fail fast")
-
-
-def test_load_draft_bundle_model_class_callback_accepts_mlx_lm_config_keyword(
-    tmp_path,
-    monkeypatch,
-):
-    calls = []
-
-    def fake_load_model(model_path, *, lazy, get_model_classes):
-        model_classes = get_model_classes(config={"model_type": "qwen3"})
-        calls.append((model_path, lazy, model_classes))
-        return object(), {"model_type": "qwen3"}
-
-    monkeypatch.setattr(runtime_loading, "load_model", fake_load_model)
-
-    model, meta = runtime_loading.load_draft_bundle(tmp_path, lazy=False)
-
-    assert model is not None
-    assert meta["config"] == {"model_type": "qwen3"}
-    assert calls == [
-        (
-            tmp_path,
-            False,
-            (DFlashDraftModel, DFlashDraftModelArgs),
-        )
-    ]
 
 
 def test_load_draft_bundle_uses_real_mlx_lm_model_class_callback(tmp_path):

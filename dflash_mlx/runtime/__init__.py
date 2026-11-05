@@ -54,12 +54,14 @@ def stream_dflash_generate(
     stop_token_ids: list[int] | None = None,
     suppress_token_ids: list[int] | None = None,
     prompt_tokens_override: list[int] | None = None,
+    prompt_token_positions: list[int] | None = None,
     quantize_kv_cache: bool = False,
     prefix_snapshot: DFlashPrefixSnapshot | None = None,
     snapshot_service: SnapshotService | None = None,
     stable_prefix_len: int | None = None,
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
+    prefix_hit_kind: str = "miss",
     runtime_context: Any = None,
 ) -> Iterator[EngineEvent]:
     if runtime_context is None:
@@ -76,7 +78,7 @@ def stream_dflash_generate(
 
     gen_stream = mx.default_stream(mx.default_device())
     with mx.stream(gen_stream):
-        yield from _stream_dflash_generate_impl(
+        inner = _stream_dflash_generate_impl(
             target_model=target_model,
             target_ops=target_ops,
             tokenizer=tokenizer,
@@ -89,11 +91,15 @@ def stream_dflash_generate(
             stop_token_ids=stop_token_ids,
             suppress_token_ids=suppress_token_ids,
             prompt_tokens_override=prompt_tokens_override,
+            prompt_token_positions=prompt_token_positions,
             quantize_kv_cache=quantize_kv_cache,
             prefix_snapshot=prefix_snapshot,
             snapshot_service=snapshot_service,
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=prefix_cache_active,
             publish_generation_snapshot=publish_generation_snapshot,
+            prefix_hit_kind=prefix_hit_kind,
             runtime_context=runtime_context,
         )
+        prefix_snapshot = None
+        yield from inner

@@ -94,11 +94,14 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "use_chat_template": True,
             "draft_ref": None,
             "target_fa_window": 0,
+            "quantize_kv_cache": False,
             "prefill_step_size": 8192,
             "draft_sink_size": 32,
             "draft_window_size": 512,
+            "draft_full_context_min_ctx": 16384,
             "verify_len_cap": 8,
             "verify_mode": "off",
+            "copyspec_mode": "conservative",
             "draft_quant": "w4",
         }
     ]
@@ -238,6 +241,7 @@ def test_run_generate_rejects_stale_dict_engine_event(monkeypatch):
             use_chat_template=False,
             draft_ref=None,
             target_fa_window=0,
+            quantize_kv_cache=False,
             prefill_step_size=1,
             draft_sink_size=1,
             draft_window_size=1,

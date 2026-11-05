@@ -142,6 +142,7 @@ class ServerRuntime:
             prompt=prepared.prompt,
             request=request,
             request_id=request_id,
+            max_new_tokens=int(args.max_tokens),
             runtime_context=runtime_context,
         )
         ctx.prompt_cache_count = prefix_flow.hit_tokens
@@ -152,6 +153,7 @@ class ServerRuntime:
             max_tokens=int(args.max_tokens),
             cache_hit_tokens=prefix_flow.hit_tokens,
             cache_lookup_ms=prefix_flow.lookup_ms,
+            hit_kind=prefix_flow.hit_kind,
         )
 
         event_iter = stream_dflash_generate(
@@ -163,6 +165,7 @@ class ServerRuntime:
             prompt="",
             max_new_tokens=args.max_tokens,
             use_chat_template=False,
+            quantize_kv_cache=bool(runtime_context.runtime.quantize_kv_cache),
             stop_token_ids=stop_token_ids,
             prompt_tokens_override=prepared.prompt,
             prefix_snapshot=prefix_flow.snapshot,
@@ -170,8 +173,10 @@ class ServerRuntime:
             stable_prefix_len=prefix_flow.stable_prefix_len,
             prefix_cache_active=prefix_flow.cache_active,
             publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
+            prefix_hit_kind=prefix_flow.hit_kind,
             runtime_context=runtime_context,
         )
+        prefix_flow.snapshot = None
         loop_result = consume_dflash_events(
             event_iter=event_iter,
             rqueue=rqueue,

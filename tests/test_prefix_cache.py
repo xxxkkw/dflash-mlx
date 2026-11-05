@@ -16,10 +16,14 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from dflash_mlx.cache.codecs import (
     PrefixSnapshotBuilder,
     build_snapshot,
+    capture_gdn_sidecar,
     hydrate_target_cache,
     serialize_target_cache,
+    sidecar_eligible,
+    slice_snapshot_at_sidecar_boundary,
 )
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.store import PrefixSnapshotStore
@@ -148,6 +152,28 @@ def _make_full_hidden_snapshot(
         kind=kind,
     )
 
+def _make_trimmed_snapshot(
+    token_ids: list[int],
+    key: DFlashPrefixKey,
+    kind: str = "prefill",
+) -> DFlashPrefixSnapshot:
+    n = len(token_ids)
+    snapshot = build_snapshot(
+        token_ids=token_ids,
+        target_cache=[
+            _make_kv_cache_populated(n_tokens=n),
+            _make_gdn_cache_populated(),
+        ],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind=kind,
+        draft_sink_size=4,
+        draft_window_size=16,
+    )
+    assert not snapshot_covers_prefix(snapshot, n)
+    return snapshot
+
 def test_l1_generation_snapshot_without_logits_is_prefix_only():
     cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
     key = _make_key()
@@ -162,6 +188,112 @@ def test_l1_generation_snapshot_without_logits_is_prefix_only():
     prefix_len, prefix = cache.lookup([1, 2, 3, 4], key)
     assert prefix_len == 3
     assert prefix is snapshot
+
+
+def test_l1_generation_hit_is_consumed_on_serve():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+    cache.insert(snapshot)
+
+    matched, served = cache.lookup([1, 2, 3, 4], key)
+    assert matched == 3
+    assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 1
+    assert stats["current_entries"] == 0
+
+    matched2, served2 = cache.lookup([1, 2, 3, 4], key)
+    assert matched2 == 0
+    assert served2 is None
+
+
+def test_l1_generation_record_false_lookup_does_not_consume():
+    # The store's L2 min_token_len pre-pass uses record=False; it must not
+    # consume the entry the final record=True lookup will serve.
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+    cache.insert(snapshot)
+
+    matched, served = cache.lookup([1, 2, 3, 4], key, record=False)
+    assert matched == 3
+    assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 0
+    assert stats["current_entries"] == 1
+
+    matched2, served2 = cache.lookup([1, 2, 3, 4], key)
+    assert matched2 == 3
+    assert served2 is snapshot
+    assert cache.stats()["generation_consumed"] == 1
+
+
+def test_l1_prefill_hit_is_not_consumed():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="prefill")
+    cache.insert(snapshot)
+
+    for _ in range(2):
+        matched, served = cache.lookup([1, 2, 3, 4], key)
+        assert matched == 3
+        assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 0
+    assert stats["current_entries"] == 1
+
+
+def test_l1_sidecar_hit_consumes_carrier():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    tokens = list(range(10, 100, 10))
+    carrier = _make_sidecar_generation_snapshot(tokens, 5, key)
+    cache.insert(carrier)
+
+    req = tokens[:5] + [777, 778]
+    matched, served = cache.lookup(req, key)
+    assert matched == 5
+    assert served is not carrier
+    assert served.prefix_len == 5
+    stats = cache.stats()
+    assert stats["sidecar_hits"] == 1
+    assert stats["generation_consumed"] == 1
+    assert stats["current_entries"] == 0
+
+    matched2, served2 = cache.lookup(req, key)
+    assert matched2 == 0
+    assert served2 is None
+
+
+def test_store_generation_l2_hit_is_not_promoted_to_l1():
+    key = _make_key()
+    l2_snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+
+    class _HitL2:
+        def __init__(self, snapshot):
+            self.snapshot = snapshot
+
+        def lookup(self, _tokens, _key, **kwargs):
+            min_token_len = int(kwargs.get("min_token_len", 0))
+            if len(self.snapshot.token_ids) <= min_token_len:
+                return None
+            return self.snapshot
+
+        def insert_async(self, snapshot):
+            return True
+
+        def stats(self):
+            return {}
+
+    l1 = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    store = PrefixSnapshotStore(l1=l1, l2=_HitL2(l2_snapshot))
+
+    first_len, first = store.lookup([1, 2, 3, 4], key)
+    assert first_len == 3
+    assert first is l2_snapshot
+    assert l1.stats()["current_entries"] == 0
+    assert store.stats()["l2_hits"] == 1
 
 
 def test_l1_prunes_dominated_prefill_snapshots_without_frontier_stride():
@@ -402,6 +534,44 @@ class TestSerializeHydrate:
         assert mx.all(src_k == h_k).item()
         assert mx.all(src_v == h_v).item()
 
+    def test_adopted_serialize_shares_arrays_and_hydrates_identically(self):
+        src = [_make_kv_cache_populated(n_tokens=5), _make_gdn_cache_populated()]
+        fa, gdn = serialize_target_cache(src, clone=False)
+
+        # Recurrent states are adopted by reference, not copied.
+        assert gdn[1] is not None
+        for adopted, live in zip(gdn[1], src[1].cache):
+            assert adopted is live
+
+        template = [KVCache(), RecurrentRollbackCache(size=3, conv_kernel_size=4)]
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3, 4, 5),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 5, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(snapshot, template)
+        src_k, src_v = src[0].state
+        h_k, h_v = hydrated[0].state
+        assert mx.all(src_k == h_k).item()
+        assert mx.all(src_v == h_v).item()
+
+    def test_build_snapshot_adopts_logits_without_clone(self):
+        logits = mx.arange(10, dtype=mx.float32).reshape(1, 10)
+        mx.eval(logits)
+        snapshot = build_snapshot(
+            token_ids=[1, 2, 3],
+            target_cache=[_make_kv_cache_populated(n_tokens=3)],
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=logits,
+            key=_make_key(),
+            kind="generation",
+            adopt_cache_arrays=True,
+        )
+        assert snapshot.last_logits is logits
+
     def test_rotating_kv_round_trip_uses_temporal_order(self):
         src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
         fa, gdn = serialize_target_cache(src)
@@ -632,6 +802,65 @@ class TestSerializeHydrate:
         assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
         assert snapshot.target_hidden_total_len == 100
 
+    def test_trimmed_snapshot_does_not_cover_prefix(self):
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=mx.zeros((1, 100, 4), dtype=mx.float32),
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=False,
+        )
+
+        assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
+        assert not snapshot_covers_prefix(snapshot, 100)
+        assert not snapshot_covers_prefix(snapshot, 50)
+        assert snapshot_covers_prefix(snapshot, 4)
+
+    def test_full_snapshot_covers_prefix(self):
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=mx.zeros((1, 100, 4), dtype=mx.float32),
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=True,
+        )
+
+        assert snapshot.target_hidden_chunk_spans == ((0, 100),)
+        assert snapshot_covers_prefix(snapshot, 100)
+        assert snapshot_covers_prefix(snapshot, 1)
+
+    def test_contiguous_generation_chunks_cover_prefix(self):
+        snap = SimpleNamespace(
+            target_hidden_chunk_spans=((0, 50), (50, 80), (80, 100)),
+        )
+        assert snapshot_covers_prefix(snap, 100)
+        assert snapshot_covers_prefix(snap, 0)
+
+    def test_gap_in_spans_does_not_cover(self):
+        snap = SimpleNamespace(target_hidden_chunk_spans=((0, 4), (10, 100)))
+        assert not snapshot_covers_prefix(snap, 100)
+        assert snapshot_covers_prefix(snap, 4)
+
     def test_snapshot_target_hidden_is_clamped_to_token_prefix(self):
         target_hidden = mx.zeros((1, 8, 4), dtype=mx.float32)
 
@@ -793,7 +1022,34 @@ class TestMutationIsolation:
         assert not mx.all(gdn[0][1] == 0).item(), \
             "GDN snapshot shares buffer with live cache — deep-copy is broken"
 
-    def test_hydrate_returns_independent_cache(self):
+    def test_hydrate_adopts_snapshot_arrays_by_reference(self):
+        src = [_make_kv_cache_populated(n_tokens=3), _make_gdn_cache_populated()]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        template = [
+            KVCache(),
+            RecurrentRollbackCache(size=3, conv_kernel_size=4),
+        ]
+        hydrated = hydrate_target_cache(snapshot, template)
+
+        assert hydrated[0].keys is snapshot.fa_states[0][0]
+        assert hydrated[0].values is snapshot.fa_states[0][1]
+        assert all(
+            live is snap
+            for live, snap in zip(hydrated[1].cache, snapshot.gdn_states[1])
+        )
+
+    def test_hydrate_adopted_cache_grows_away_from_snapshot(self):
+        # Adopted FA arrays have capacity == offset, so the first update takes
+        # the growth path (fresh buffer); the snapshot stays bitwise intact
+        # through both the growth update and a later in-place update.
         src = [_make_kv_cache_populated(n_tokens=3)]
         fa, gdn = serialize_target_cache(src)
         snapshot = _make_full_hidden_snapshot(
@@ -804,17 +1060,64 @@ class TestMutationIsolation:
             last_logits=mx.zeros((1, 10)),
             key=_make_key(),
         )
-        template = [KVCache()]
-        hydrated1 = hydrate_target_cache(snapshot, template)
-        hydrated2 = hydrate_target_cache(snapshot, template)
+        snap_k_before = mx.array(snapshot.fa_states[0][0])
+        snap_v_before = mx.array(snapshot.fa_states[0][1])
+        mx.eval(snap_k_before, snap_v_before)
 
-        hydrated1[0].keys = mx.zeros_like(hydrated1[0].keys)
-        mx.eval(hydrated1[0].keys)
+        hydrated = hydrate_target_cache(snapshot, [KVCache()])
+        adopted_k = hydrated[0].keys
+        new_k = mx.full((1, 2, 1, 8), -7.0, dtype=mx.float32)
+        new_v = mx.full((1, 2, 1, 8), -9.0, dtype=mx.float32)
+        out_k, out_v = hydrated[0].update_and_fetch(new_k, new_v)
+        mx.eval(out_k, out_v)
+        out_k2, out_v2 = hydrated[0].update_and_fetch(new_k + 1.0, new_v + 1.0)
+        mx.eval(out_k2, out_v2)
 
-        h2_k, _ = hydrated2[0].state
-        assert not mx.all(h2_k == 0).item()
-        snap_k, _, _ = snapshot.fa_states[0]
-        assert not mx.all(snap_k == 0).item()
+        assert hydrated[0].keys is not adopted_k
+        assert mx.array_equal(snapshot.fa_states[0][0], snap_k_before).item()
+        assert mx.array_equal(snapshot.fa_states[0][1], snap_v_before).item()
+        assert mx.array_equal(out_k2[..., :3, :], snap_k_before).item()
+        assert mx.array_equal(out_k2[..., 3:4, :], new_k).item()
+        assert mx.array_equal(out_k2[..., 4:5, :], new_k + 1.0).item()
+        assert mx.array_equal(out_v2[..., 3:4, :], new_v).item()
+
+    def test_hydrate_adopted_gdn_survives_live_replacement(self):
+        src = [_make_gdn_cache_populated(size=3, conv_k=4)]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        before = mx.array(snapshot.gdn_states[0][1])
+        mx.eval(before)
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [RecurrentRollbackCache(size=3, conv_kernel_size=4)],
+        )
+        hydrated[0].cache[1] = mx.zeros_like(hydrated[0].cache[1])
+        mx.eval(hydrated[0].cache[1])
+
+        assert mx.array_equal(snapshot.gdn_states[0][1], before).item()
+
+    def test_hydrate_rejects_fa_arrays_with_spare_capacity(self):
+        # Adoption is only legal for exact-length arrays; spare capacity would
+        # let update_and_fetch write in place into the shared buffer.
+        k = mx.zeros((1, 2, 5, 8), dtype=mx.float32)
+        v = mx.zeros((1, 2, 5, 8), dtype=mx.float32)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=((k, v, 3),),
+            gdn_states=(None,),
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        with pytest.raises(ValueError, match="cannot adopt"):
+            hydrate_target_cache(snapshot, [KVCache()])
 
 class TestSnapshot:
     def test_prefix_len_matches_token_ids(self):
@@ -1398,6 +1701,29 @@ class TestSkipLongSnapshot:
         assert stats["skipped_too_long"] == 0
         assert stats["insertions"] == 1
 
+    def test_generation_snapshot_can_exceed_token_cap(self):
+        cache = DFlashPrefixCache(
+            max_entries=8,
+            max_bytes=8 * 1024 * 1024 * 1024,
+            max_snapshot_tokens=5,
+        )
+        key = _make_key()
+        generation = _make_synthetic_snapshot(
+            [1, 2, 3, 4, 5, 6],
+            key,
+            kind="generation",
+        )
+
+        cache.insert(generation)
+
+        stats = cache.stats()
+        assert stats["current_entries"] == 1
+        assert stats["skipped_too_long"] == 0
+        assert stats["insertions"] == 1
+        prefix_len, prefix = cache.lookup([1, 2, 3, 4, 5, 6, 7], key)
+        assert prefix_len == 6
+        assert prefix is generation
+
     def test_disabled_with_zero(self):
         cache = DFlashPrefixCache(
             max_entries=8,
@@ -1512,13 +1838,316 @@ class TestByteBudget:
 
         assert result.admitted is True
         assert result.inserted_evicted_snapshot is None
+        stats = cache.stats()
+        assert stats["current_entries"] == 2
+        assert stats["evictions"] == 1
+        assert stats["byte_budget_evictions"] == 1
         exact_len, exact = cache.lookup([1, 2, 3], key)
         assert exact_len == 3
         assert exact is prefill
         prefix_len, prefix = cache.lookup([1, 2, 3, 4, 5, 6], key)
         assert prefix_len == 5
         assert prefix is generation
+        # Serving the generation hit consumes it; the prefill entry remains.
         stats = cache.stats()
-        assert stats["current_entries"] == 2
-        assert stats["evictions"] == 1
-        assert stats["byte_budget_evictions"] == 1
+        assert stats["current_entries"] == 1
+        assert stats["generation_consumed"] == 1
+
+def _make_sidecar_generation_snapshot(
+    token_ids: list[int],
+    boundary: int,
+    key: DFlashPrefixKey,
+) -> DFlashPrefixSnapshot:
+    n = len(token_ids)
+    kv_cache = _make_kv_cache_populated(n_tokens=n)
+    gdn_cache = _make_gdn_cache_populated()
+    sidecar_gdn = capture_gdn_sidecar([kv_cache, gdn_cache])
+    return build_snapshot(
+        token_ids=token_ids,
+        target_cache=[kv_cache, gdn_cache],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="generation",
+        sidecar_boundary=boundary,
+        sidecar_gdn_states=sidecar_gdn,
+        sidecar_last_logits=mx.full((1, 32), 7.0, dtype=mx.float32),
+    )
+
+
+class TestSidecar:
+    def test_capture_gdn_sidecar_grabs_refs_and_survives_replacement(self):
+        kv_cache = _make_kv_cache_populated()
+        gdn_cache = _make_gdn_cache_populated()
+        sidecar = capture_gdn_sidecar([kv_cache, gdn_cache])
+        assert sidecar[0] is None
+        assert sidecar[1][0] is gdn_cache.cache[0]
+        before = float(sidecar[1][0][0, 0, 0].item())
+        gdn_cache.cache[0] = mx.zeros_like(gdn_cache.cache[0])
+        assert float(sidecar[1][0][0, 0, 0].item()) == before
+
+    def test_sidecar_eligible_rejects_rotating(self):
+        assert sidecar_eligible(
+            [_make_kv_cache_populated(), _make_gdn_cache_populated()]
+        )
+        assert not sidecar_eligible(
+            [_make_rotating_cache_populated(), _make_gdn_cache_populated()]
+        )
+
+    def test_slice_snapshot_at_sidecar_boundary(self):
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        sliced = slice_snapshot_at_sidecar_boundary(snap)
+        assert sliced.kind == "prefill"
+        assert sliced.token_ids == tuple(tokens[:5])
+        k, v, offset = sliced.fa_states[0]
+        assert k.shape == (1, 2, 5, 8)
+        assert v.shape == (1, 2, 5, 8)
+        assert offset == 5
+        assert mx.array_equal(k, snap.fa_states[0][0][:, :, :5, :]).item()
+        assert sliced.gdn_states is snap.sidecar_gdn_states
+        assert sliced.last_logits is snap.sidecar_last_logits
+        assert sliced.target_hidden_chunk_spans == ((0, 5),)
+        assert sliced.target_hidden_total_len == 5
+        hydrated = hydrate_target_cache(
+            sliced,
+            [KVCache(), _make_gdn_cache_populated()],
+        )
+        assert hydrated[0].offset == 5
+
+    def test_slice_rejects_uncovered_boundary(self):
+        key = _make_key(draft_sink_size=2, draft_window_size=2)
+        snap = _make_sidecar_generation_snapshot(list(range(1, 9)), 5, key)
+        snap.target_hidden_chunks = (
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+            mx.zeros((1, 5, 8), dtype=mx.float32),
+        )
+        snap.target_hidden_chunk_spans = ((0, 2), (3, 8))
+        with pytest.raises(ValueError, match="do not cover"):
+            slice_snapshot_at_sidecar_boundary(snap, require_full_coverage=True)
+        sliced = slice_snapshot_at_sidecar_boundary(snap)
+        assert sliced.prefix_len == 5
+        assert sliced.target_hidden_chunk_spans == ((0, 2), (3, 5))
+
+    def test_build_snapshot_sidecar_contract(self):
+        key = _make_key()
+        kv_cache = _make_kv_cache_populated(n_tokens=4)
+        gdn_cache = _make_gdn_cache_populated()
+        common = dict(
+            token_ids=[1, 2, 3, 4],
+            target_cache=[kv_cache, gdn_cache],
+            target_hidden=mx.zeros((1, 4, 8), dtype=mx.float32),
+            last_logits=mx.zeros((1, 32), dtype=mx.float32),
+            key=key,
+        )
+        sidecar_gdn = capture_gdn_sidecar([kv_cache, gdn_cache])
+        logits = mx.zeros((1, 32), dtype=mx.float32)
+        with pytest.raises(ValueError, match="generation"):
+            build_snapshot(
+                kind="prefill",
+                sidecar_boundary=2,
+                sidecar_gdn_states=sidecar_gdn,
+                sidecar_last_logits=logits,
+                **common,
+            )
+        with pytest.raises(ValueError, match="must be <"):
+            build_snapshot(
+                kind="generation",
+                sidecar_boundary=4,
+                sidecar_gdn_states=sidecar_gdn,
+                sidecar_last_logits=logits,
+                **common,
+            )
+        with pytest.raises(ValueError, match="requires sidecar"):
+            build_snapshot(kind="generation", sidecar_boundary=2, **common)
+
+    def test_l1_lookup_serves_sidecar_on_divergence_inside_generation(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+
+        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99, 98], key)
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert hit.token_ids == tuple(tokens[:5])
+        assert hit.gdn_states is snap.sidecar_gdn_states
+        assert hit.last_logits is snap.sidecar_last_logits
+        assert cache.stats()["sidecar_hits"] == 1
+        assert cache.last_hit_kind == "l1_prefix"
+
+    def test_l1_lookup_sidecar_requires_boundary_within_request(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
+        cache.insert(snap)
+        matched, hit = cache.lookup([1, 2, 3, 99], key)
+        assert matched == 0
+        assert hit is None
+
+    def test_l1_lookup_sidecar_serves_request_shorter_than_snapshot(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+        matched, hit = cache.lookup(tokens[:6], key)
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert hit.token_ids == tuple(tokens[:5])
+
+    def test_l1_lookup_prefers_full_snapshot_over_sidecar_at_same_length(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        gen = _make_sidecar_generation_snapshot(tokens, 5, key)
+        full = _make_synthetic_snapshot(tokens[:5], key)
+        cache.insert(gen)
+        cache.insert(full)
+        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99], key)
+        assert matched == 5
+        assert hit is full
+        assert cache.stats()["sidecar_hits"] == 0
+
+    def test_nbytes_breakdown_counts_sidecar(self):
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
+        breakdown = snap.nbytes_breakdown()
+        expected = sum(
+            int(a.nbytes)
+            for gdn in snap.sidecar_gdn_states
+            if gdn is not None
+            for a in gdn
+            if a is not None
+        ) + int(snap.sidecar_last_logits.nbytes)
+        assert breakdown["sidecar"] == expected
+        assert snap.nbytes > expected
+
+class TestCoverageFilterL1:
+    def test_lookup_rejects_trimmed_snapshot_when_full_coverage_required(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        trimmed = _make_trimmed_snapshot(list(range(100)), key)
+        cache.insert(trimmed)
+
+        matched, hit = cache.lookup(
+            list(range(100)) + [999], key, require_full_coverage=True
+        )
+        assert matched == 0
+        assert hit is None
+        stats = cache.stats()
+        assert stats["coverage_rejects"] == 1
+        assert stats["misses"] == 1
+
+        matched, hit = cache.lookup(list(range(100)) + [999], key)
+        assert matched == 100
+        assert hit is trimmed
+        assert cache.stats()["coverage_rejects"] == 1
+
+    def test_lookup_falls_back_to_shorter_covering_snapshot(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        trimmed_long = _make_trimmed_snapshot(list(range(60)), key)
+        covering_short = _make_synthetic_snapshot(list(range(30)), key)
+        cache.insert(trimmed_long)
+        cache.insert(covering_short)
+
+        matched, hit = cache.lookup(
+            list(range(60)) + [999], key, require_full_coverage=True
+        )
+        assert matched == 30
+        assert hit is covering_short
+        stats = cache.stats()
+        assert stats["coverage_rejects"] == 1
+        assert stats["prefix_hits"] == 1
+
+    def test_full_snapshot_serves_windowed_and_full_context_requests(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        full = _make_synthetic_snapshot([1, 2, 3, 4], key)
+        cache.insert(full)
+
+        matched, hit = cache.lookup([1, 2, 3, 4, 5], key)
+        assert (matched, hit) == (4, full)
+
+        matched, hit = cache.lookup(
+            [1, 2, 3, 4, 5], key, require_full_coverage=True
+        )
+        assert (matched, hit) == (4, full)
+        assert cache.stats()["coverage_rejects"] == 0
+
+    def test_sidecar_hit_survives_coverage_filter(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+
+        matched, hit = cache.lookup(
+            [1, 2, 3, 4, 5, 99, 98], key, require_full_coverage=True
+        )
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert snapshot_covers_prefix(hit, hit.prefix_len)
+        stats = cache.stats()
+        assert stats["sidecar_hits"] == 1
+        assert stats["coverage_rejects"] == 0
+
+
+def _make_trimmed_sidecar_carrier(
+    tokens: list[int],
+    boundary: int,
+    key: DFlashPrefixKey,
+) -> DFlashPrefixSnapshot:
+    kv_cache = _make_kv_cache_populated(n_tokens=len(tokens))
+    gdn_cache = _make_gdn_cache_populated()
+    return build_snapshot(
+        token_ids=tokens,
+        target_cache=[kv_cache, gdn_cache],
+        target_hidden=mx.zeros((1, len(tokens), 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="generation",
+        draft_sink_size=key.draft_sink_size,
+        draft_window_size=key.draft_window_size,
+        sidecar_boundary=boundary,
+        sidecar_gdn_states=capture_gdn_sidecar([kv_cache, gdn_cache]),
+        sidecar_last_logits=mx.full((1, 32), 7.0, dtype=mx.float32),
+    )
+
+
+class TestTrimmedSidecar:
+    def test_windowed_draft_restores_trimmed_sidecar(self):
+        key = _make_key(draft_sink_size=4, draft_window_size=16)
+        tokens = list(range(1000, 1064))
+        carrier = _make_trimmed_sidecar_carrier(tokens, 48, key)
+
+        assert carrier.target_hidden_chunk_spans == ((0, 4), (32, 64))
+        sliced = slice_snapshot_at_sidecar_boundary(carrier)
+        assert sliced.target_hidden_chunk_spans == ((0, 4), (32, 48))
+        cache = DFlashPrefixCache(max_entries=8)
+        cache.insert(carrier)
+
+        matched, served = cache.lookup(tokens[:48], key)
+
+        assert matched == 48
+        assert served is not None and served.kind == "prefill"
+        assert cache.stats()["sidecar_hits"] == 1
+
+    def test_full_context_draft_rejects_trimmed_sidecar(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key(draft_sink_size=4, draft_window_size=16)
+        tokens = list(range(1000, 1064))
+        cache.insert(_make_trimmed_sidecar_carrier(tokens, 48, key))
+
+        matched, served = cache.lookup(
+            tokens[:48], key, require_full_coverage=True
+        )
+
+        assert matched == 0
+        assert served is None

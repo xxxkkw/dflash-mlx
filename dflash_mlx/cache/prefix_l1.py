@@ -11,8 +11,13 @@ from typing import Any, Optional
 
 from dflash_mlx.observability.cache import record_cache_event
 from dflash_mlx.diagnostics import TraceConfig
+from dflash_mlx.cache.codecs import (
+    slice_snapshot_at_sidecar_boundary,
+    snapshot_covers_sidecar_context,
+)
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 
 
 @dataclass(frozen=True)
@@ -56,11 +61,43 @@ class DFlashPrefixCache:
             "cross_kind_prunes": 0,
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
+            "sidecar_hits": 0,
+            "coverage_rejects": 0,
+            "generation_consumed": 0,
         }
+        # Updated on every record=True lookup; "miss" / "l1_exact" / "l1_prefix".
+        # Guarded by _lock; readable via last_hit_kind property.
+        self._last_hit_kind: str = "miss"
 
     @property
     def frontier_stride(self) -> int:
         return int(self._frontier_stride)
+
+    @property
+    def last_hit_kind(self) -> str:
+        with self._lock:
+            return self._last_hit_kind
+
+    @staticmethod
+    def _usable_sidecar_boundary(
+        snap: DFlashPrefixSnapshot,
+        req_tuple: tuple[int, ...],
+        require_full_coverage: bool = False,
+    ) -> int:
+        boundary = int(snap.sidecar_boundary)
+        if boundary <= 0 or boundary > len(req_tuple):
+            return 0
+        if snap.sidecar_gdn_states is None or snap.sidecar_last_logits is None:
+            return 0
+        if req_tuple[:boundary] != snap.token_ids[:boundary]:
+            return 0
+        if not snapshot_covers_sidecar_context(
+            snap,
+            boundary,
+            require_full_coverage=require_full_coverage,
+        ):
+            return 0
+        return boundary
 
     def lookup(
         self,
@@ -69,6 +106,7 @@ class DFlashPrefixCache:
         *,
         record: bool = True,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, Optional[DFlashPrefixSnapshot]]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
@@ -77,7 +115,11 @@ class DFlashPrefixCache:
             best_len = 0
             best_id = -1
             best_snapshot: Optional[DFlashPrefixSnapshot] = None
+            best_sidecar_len = 0
+            best_sidecar_id = -1
+            best_sidecar_carrier: Optional[DFlashPrefixSnapshot] = None
             saw_fingerprint_reject = 0
+            coverage_rejects = 0
             longest_fingerprint_match_len = 0
             longest_fingerprint_first_divergence = -1
             for eid, snap in self._entries.items():
@@ -86,6 +128,13 @@ class DFlashPrefixCache:
                     continue
                 snap_len = len(snap.token_ids)
                 if snap_len == 0 or snap_len > len(req_tuple):
+                    boundary = self._usable_sidecar_boundary(
+                        snap, req_tuple, require_full_coverage
+                    )
+                    if boundary > best_sidecar_len:
+                        best_sidecar_len = boundary
+                        best_sidecar_id = eid
+                        best_sidecar_carrier = snap
                     continue
                 if req_tuple[:snap_len] != snap.token_ids:
                     common = 0
@@ -97,11 +146,34 @@ class DFlashPrefixCache:
                     if common > longest_fingerprint_match_len:
                         longest_fingerprint_match_len = common
                         longest_fingerprint_first_divergence = common
+                    boundary = self._usable_sidecar_boundary(
+                        snap, req_tuple, require_full_coverage
+                    )
+                    if boundary > best_sidecar_len:
+                        best_sidecar_len = boundary
+                        best_sidecar_id = eid
+                        best_sidecar_carrier = snap
+                    continue
+                if require_full_coverage and not snapshot_covers_prefix(snap, snap_len):
+                    coverage_rejects += 1
                     continue
                 if snap_len > best_len:
                     best_len = snap_len
                     best_id = eid
                     best_snapshot = snap
+
+            sidecar_used = False
+            if best_sidecar_carrier is not None and best_sidecar_len > best_len:
+                best_len = best_sidecar_len
+                best_id = best_sidecar_id
+                best_snapshot = slice_snapshot_at_sidecar_boundary(
+                    best_sidecar_carrier,
+                    require_full_coverage=require_full_coverage,
+                )
+                sidecar_used = True
+
+            if record and coverage_rejects:
+                self._stats["coverage_rejects"] += coverage_rejects
 
             if best_snapshot is not None and best_len > 0:
                 exact = best_len == len(req_tuple)
@@ -111,15 +183,27 @@ class DFlashPrefixCache:
                 ):
                     best_snapshot = None
                 else:
-
+                    # Served generation snapshots are dominated by the successor
+                    # published at request end; consume them on first serve.
                     if record:
-                        if best_id in self._lru_order:
-                            self._lru_order.remove(best_id)
-                        self._lru_order.append(best_id)
+                        consumed = sidecar_used or best_snapshot.kind == "generation"
+                        if consumed:
+                            self._entries.pop(best_id, None)
+                            if best_id in self._lru_order:
+                                self._lru_order.remove(best_id)
+                            self._stats["generation_consumed"] += 1
+                        else:
+                            if best_id in self._lru_order:
+                                self._lru_order.remove(best_id)
+                            self._lru_order.append(best_id)
                         if exact:
                             self._stats["exact_hits"] += 1
+                            self._last_hit_kind = "l1_exact"
                         else:
                             self._stats["prefix_hits"] += 1
+                            self._last_hit_kind = "l1_prefix"
+                        if sidecar_used:
+                            self._stats["sidecar_hits"] += 1
                         self._stats["prefill_tokens_saved"] += best_len
                         entries_count_log = len(self._entries)
                         self._log_cache(
@@ -129,6 +213,7 @@ class DFlashPrefixCache:
                             req_tokens=len(req_tuple),
                             matched_len=int(best_len),
                             entries=entries_count_log,
+                            consumed=int(consumed),
                             elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
                         )
                     return (best_len, best_snapshot)
@@ -137,11 +222,14 @@ class DFlashPrefixCache:
                 return (0, None)
 
             self._stats["misses"] += 1
+            self._last_hit_kind = "miss"
             miss_reason = "empty_cache"
             if self._entries:
                 if saw_fingerprint_reject == len(self._entries):
                     miss_reason = "fingerprint_reject_all"
                     self._stats["fingerprint_rejects"] += 1
+                elif coverage_rejects > 0:
+                    miss_reason = "coverage_reject"
                 elif saw_fingerprint_reject > 0 and longest_fingerprint_match_len == 0:
                     miss_reason = "fingerprint_reject_partial_no_token_match"
                     self._stats["fingerprint_rejects"] += 1
@@ -151,6 +239,7 @@ class DFlashPrefixCache:
                     miss_reason = "token_divergence"
             entries_count = len(self._entries)
             sfr = int(saw_fingerprint_reject)
+            cov_rejects = int(coverage_rejects)
             longest_match = int(longest_fingerprint_match_len)
             first_div = int(longest_fingerprint_first_divergence)
 
@@ -162,6 +251,7 @@ class DFlashPrefixCache:
             matched_len=0,
             entries=entries_count,
             fingerprint_reject=sfr,
+            coverage_rejects=cov_rejects,
             miss_reason=miss_reason,
             longest_token_match_len=longest_match,
             first_divergence_pos=first_div,
@@ -188,7 +278,13 @@ class DFlashPrefixCache:
             pre_cross_prunes = self._stats["cross_kind_prunes"]
 
             max_tokens = self._max_snapshot_tokens
-            if skip_too_long and max_tokens > 0 and len(snapshot.token_ids) > max_tokens:
+            token_cap_applies = snapshot.kind != "generation"
+            if (
+                skip_too_long
+                and token_cap_applies
+                and max_tokens > 0
+                and len(snapshot.token_ids) > max_tokens
+            ):
                 self._stats["skipped_too_long"] += 1
                 self._log_cache(
                     op="insert_skipped",
@@ -439,6 +535,12 @@ class DFlashPrefixCache:
         with self._lock:
             self._entries.clear()
             self._lru_order.clear()
+
+    def resident_snapshots(self) -> tuple[DFlashPrefixSnapshot, ...]:
+        with self._lock:
+            return tuple(
+                self._entries[eid] for eid in self._lru_order if eid in self._entries
+            )
 
     def shutdown(self) -> None:
         return None

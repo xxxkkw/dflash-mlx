@@ -43,40 +43,52 @@ def build_runtime_context(
 def build_offline_runtime_config(
     *,
     target_fa_window: int | None = None,
+    quantize_kv_cache: bool | None = None,
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> EffectiveRuntimeConfig:
     runtime_config = _runtime_config_from_defaults(
         prefix_cache=False,
         prefix_cache_l2=False,
         target_fa_window=0 if target_fa_window is None else int(target_fa_window),
+        quantize_kv_cache=quantize_kv_cache,
         prefill_step_size=prefill_step_size,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        draft_full_context_min_ctx=draft_full_context_min_ctx,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return validate_runtime_config(runtime_config)
 
 def build_offline_runtime_context(
     *,
     target_fa_window: int | None = None,
+    quantize_kv_cache: bool | None = None,
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> RuntimeContext:
     runtime_config = build_offline_runtime_config(
         target_fa_window=target_fa_window,
+        quantize_kv_cache=quantize_kv_cache,
         prefill_step_size=prefill_step_size,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        draft_full_context_min_ctx=draft_full_context_min_ctx,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return build_runtime_context(runtime_config)
 

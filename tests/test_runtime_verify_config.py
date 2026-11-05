@@ -291,10 +291,13 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS) == {
         "prefill_step_size": 2048,
         "target_fa_window": 2048,
+        "quantize_kv_cache": False,
         "draft_sink_size": 64,
         "draft_window_size": 512,
+        "draft_full_context_min_ctx": 16384,
         "verify_len_cap": 0,
         "verify_mode": "ddtree",
+        "copyspec_mode": "conservative",
     }
 
 
@@ -388,6 +391,29 @@ def test_speculative_cycle_config_defaults_to_draft_block_size():
     assert cycle.verify_len_cap == 16
 
 
+def test_speculative_cycle_config_honors_draft_default_block_capability():
+    cfg = runtime_config_from_defaults(verify_len_cap=0)
+    draft = SimpleNamespace(
+        block_size=8,
+        capabilities=SimpleNamespace(default_block_tokens=5, max_block_tokens=5),
+    )
+
+    default_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=None)
+    low_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=4)
+    explicit_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=8)
+    high_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=16)
+
+    assert default_cycle.requested_block_tokens == 5
+    assert default_cycle.effective_block_tokens == 5
+    assert default_cycle.verify_len_cap == 5
+    assert low_cycle.requested_block_tokens == 4
+    assert low_cycle.effective_block_tokens == 4
+    assert explicit_cycle.requested_block_tokens == 8
+    assert explicit_cycle.effective_block_tokens == 5
+    assert high_cycle.requested_block_tokens == 16
+    assert high_cycle.effective_block_tokens == 5
+
+
 def test_speculative_cycle_config_clamps_requested_block_size():
     cfg = runtime_config_from_defaults(verify_len_cap=0)
     draft = SimpleNamespace(block_size=16)
@@ -409,3 +435,37 @@ def test_speculative_cycle_config_threads_verify_cap_after_block_clamp():
 
     assert cycle.effective_block_tokens == 12
     assert cycle.verify_len_cap == 4
+
+
+def test_copyspec_mode_default_is_conservative():
+    cfg = runtime_config_from_defaults()
+
+    assert cfg.copyspec_mode == "conservative"
+
+
+def test_copyspec_mode_accepts_valid_choices():
+    for mode in ("conservative", "auto", "off"):
+        cfg = runtime_config_from_defaults(copyspec_mode=mode)
+        assert cfg.copyspec_mode == mode
+
+
+def test_copyspec_mode_rejects_invalid_value():
+    with pytest.raises(ValueError, match="copyspec_mode must be conservative"):
+        runtime_config_from_defaults(copyspec_mode="always")
+
+
+def test_offline_runtime_arguments_accept_copyspec_mode():
+    parser = argparse.ArgumentParser()
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
+
+    args = parser.parse_args(["--copyspec-mode", "auto"])
+
+    assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS)["copyspec_mode"] == "auto"
+
+
+def test_offline_runtime_arguments_reject_invalid_copyspec_mode():
+    parser = argparse.ArgumentParser()
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--copyspec-mode", "always"])

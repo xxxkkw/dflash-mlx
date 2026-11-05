@@ -108,6 +108,13 @@ class CycleCompleteEvent:
     prefix_len: int | None = None
     draft_source: str | None = None
     candidate_count: int | None = None
+    proposed_ids: tuple[int, ...] | None = None
+    posterior_ids: tuple[int, ...] | None = None
+    committed_ids: tuple[int, ...] | None = None
+    draft_topk_ids: tuple[tuple[int, ...], ...] | None = None
+    draft_topk_logprobs: tuple[tuple[float, ...], ...] | None = None
+    posterior_top2_ids: tuple[tuple[int, ...], ...] | None = None
+    posterior_top2_logprobs: tuple[tuple[float, ...], ...] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         cycle_wall_us = (
@@ -140,6 +147,29 @@ class CycleCompleteEvent:
             payload["draft_source"] = str(self.draft_source)
         if self.candidate_count is not None:
             payload["candidate_count"] = int(self.candidate_count)
+        if self.proposed_ids is not None:
+            payload["proposed_ids"] = [int(t) for t in self.proposed_ids]
+        if self.posterior_ids is not None:
+            payload["posterior_ids"] = [int(t) for t in self.posterior_ids]
+        if self.committed_ids is not None:
+            payload["committed_ids"] = [int(t) for t in self.committed_ids]
+        if self.draft_topk_ids is not None:
+            payload["draft_topk_ids"] = [
+                [int(t) for t in row] for row in self.draft_topk_ids
+            ]
+        if self.draft_topk_logprobs is not None:
+            payload["draft_topk_logprobs"] = [
+                [round(float(v), 6) for v in row] for row in self.draft_topk_logprobs
+            ]
+        if self.posterior_top2_ids is not None:
+            payload["posterior_top2_ids"] = [
+                [int(t) for t in row] for row in self.posterior_top2_ids
+            ]
+        if self.posterior_top2_logprobs is not None:
+            payload["posterior_top2_logprobs"] = [
+                [round(float(v), 6) for v in row]
+                for row in self.posterior_top2_logprobs
+            ]
         return payload
 
 
@@ -180,6 +210,7 @@ class SummaryEvent:
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
     adaptive_metrics: dict[str, Any] | None = None
+    hit_kind: str = "miss"
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -225,6 +256,7 @@ class SummaryEvent:
             ),
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
+        payload["hit_kind"] = self.hit_kind
         if self.fallback_ar:
             payload["fallback_ar"] = True
             payload["fallback_reason"] = self.fallback_reason

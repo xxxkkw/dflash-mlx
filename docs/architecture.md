@@ -42,9 +42,9 @@ for small `max_tokens` requests, controlled by `--fastpath-max-tokens` (default
 `0`, disabled), but that is a serving policy after a valid runtime has already
 loaded.
 
-The current DFlash draft class is `DFlashDraftModel`. Target-family behavior is
-owned by `engine.target_ops`; the registered concrete implementations are
-`engine.target_qwen_gdn` and `engine.target_gemma4`.
+Draft checkpoint dispatch selects `DFlashDraftModel` or `DFlash2DraftModel`.
+Target-family behavior is owned by `engine.target_ops`; the registered concrete
+implementations are `engine.target_qwen_gdn` and `engine.target_gemma4`.
 
 Adding another architecture is a real adapter project, not just a new registry
 row. The required seam for more architectures is:
@@ -108,8 +108,9 @@ The server wraps `mlx_lm.server` rather than replacing it.
 9. `cache.snapshot_service.SnapshotService` builds and admits snapshots through
    the runtime cache manager.
 
-The prefix cache is process-local. The runtime cache manager owns the singleton
-lifecycle keyed by relevant runtime config so repeated requests can share state.
+The prefix cache is process-local. Runtime cache managers are registered by
+target/draft model identity; each manager owns the config-keyed lifecycle shared
+by repeated requests for that model pair.
 
 ## Offline Generate Flow
 
@@ -204,6 +205,28 @@ The key includes target id, draft id, capture layer ids, draft sink/window,
 target FA window, and format version. This is what prevents incompatible
 snapshots from being reused across different runtime shapes.
 
+## Snapshot Lifecycle
+
+- Prefill publishes are skipped when an end-of-request generation snapshot
+  will follow; that snapshot adopts the live cache arrays instead of cloning
+  them. Adoption is safe because GDN entries are replaced on every update
+  (never mutated in place) and exact-length FA arrays force the growth path
+  on the next update.
+- Generation snapshots carry a GDN boundary sidecar: recurrent state and
+  logits captured at the stable-prefix boundary, the last point where that
+  state exists — GDN cannot be rewound. The sidecar lets a later request
+  restore at a point inside the snapshot instead of missing.
+- L1 serves a generation snapshot once, then consumes it: the request it
+  serves publishes a strictly dominating successor at its end, so keeping
+  the served entry would pin multi-GB arrays for hits that can never come.
+- L2 disk writes are paused while a request is served and flush between
+  requests. At shutdown, resident L1 entries spill to L2 so the next session
+  warm-starts; generation snapshots reach disk only through this spill.
+- L2 eviction is LRU by file mtime and lookups touch served files. A
+  full-coverage snapshot gets a distinct fingerprint so a trimmed twin of
+  the same tokens cannot shadow it, and full-context draft requests reject
+  non-covering snapshots at lookup.
+
 ## Diagnostics
 
 Diagnostics are opt-in for structured JSONL artifacts:
@@ -282,10 +305,12 @@ Engine:
 Draft/model/kernels:
 
 - `dflash_mlx/model.py` - DFlash draft model;
+- `dflash_mlx/draft/` - draft architecture dispatch and DFlash2-specific
+  draft modules;
 - `dflash_mlx/draft_backend.py` - masked-block draft call;
 - `dflash_mlx/kernels.py` - local kernel helpers;
 - `dflash_mlx/verify_linear.py` and `dflash_mlx/verify_qmm.py` - verify
-  implementation paths;
+  implementation paths, including Apple G17 NAX and steel fallback kernels;
 - `dflash_mlx/recurrent_rollback_cache.py` - GDN rollback cache.
 
 Prefix cache:

@@ -147,7 +147,7 @@ class _RecordingL2:
     def __init__(self) -> None:
         self.snapshots: list[DFlashPrefixSnapshot] = []
 
-    def lookup(self, req_tokens, key, *, min_token_len: int = 0):
+    def lookup(self, req_tokens, key, *, min_token_len: int = 0, require_full_coverage: bool = False):
         req_tuple = tuple(int(token) for token in req_tokens)
         matches = [
             snapshot
@@ -812,6 +812,59 @@ def test_generation_snapshot_restore_computes_only_prompt_tail():
     assert prefill_event.prefill_tokens_computed == 2
 
 
+def test_prefix_snapshot_released_after_prefill_seam():
+    import gc
+    import weakref
+
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    snapshot = _prefix_snapshot(
+        token_ids=(1, 2, 0, 0, 0),
+        kind="generation",
+    )
+    snapshot_ref = weakref.ref(snapshot)
+    context = build_runtime_context(
+        runtime_config_from_defaults(
+            prefill_step_size=4,
+            prefix_cache=True,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = spec_epoch.stream_dflash_generate_impl(
+        target_model=object(),
+        target_ops=target_ops,
+        tokenizer=object(),
+        draft_model=draft_model,
+        draft_backend=draft_backend,
+        prompt="unused",
+        max_new_tokens=8,
+        prompt_tokens_override=[1, 2, 0, 0, 0, 88, 89],
+        prefix_snapshot=snapshot,
+        snapshot_service=_snapshot_service(draft_model),
+        stable_prefix_len=7,
+        prefix_cache_active=True,
+        runtime_context=context,
+    )
+    del snapshot
+    try:
+        saw_prefill_complete = False
+        for event in events:
+            if isinstance(event, PrefillCompleteEvent):
+                saw_prefill_complete = True
+                break
+        assert saw_prefill_complete
+        gc.collect()
+        assert snapshot_ref() is None, (
+            "prefix snapshot must be released once prefill consumed it, "
+            "not stay pinned by request/generator refs for the whole "
+            "generation"
+        )
+    finally:
+        events.close()
+
+
 def test_warm_exact_hit_skips_prefill_republish():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()
@@ -1312,11 +1365,11 @@ def test_generation_snapshot_published_for_truncated_stable_prefix():
         )
     )
 
-    prefill_snapshot = next(
+    prefill_snapshots = [
         event
         for event in events
         if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
-    )
+    ]
     generation_snapshots = [
         event
         for event in events
@@ -1324,13 +1377,119 @@ def test_generation_snapshot_published_for_truncated_stable_prefix():
     ]
     matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
 
-    assert prefill_snapshot.prefix_len == 2
+    # The generation snapshot subsumes every prefill prefix, so no
+    # prefill-kind snapshot is published when generation will run.
+    assert prefill_snapshots == []
     assert len(generation_snapshots) == 1
     assert generation_snapshots[0].kind == "generation"
     assert generation_snapshots[0].prefix_len == 9
     assert matched == 9
     assert snapshot is not None
     assert snapshot.kind == "generation"
+
+
+def test_generation_snapshot_carries_gdn_sidecar_at_stable_boundary(monkeypatch):
+    monkeypatch.setattr(spec_epoch, "_SIDECAR_MIN_BOUNDARY", 2)
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2, 3],
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    # Non-consuming peek (record=False) to inspect the published snapshot
+    # without serving it.
+    matched, snapshot = cache.lookup(
+        [1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key, record=False
+    )
+    assert matched == 9
+    assert snapshot is not None
+    assert snapshot.kind == "generation"
+    assert snapshot.sidecar_boundary == 2
+    assert snapshot.sidecar_gdn_states is not None
+    assert snapshot.sidecar_last_logits is not None
+    assert snapshot.sidecar_last_logits.shape == (1, 8)
+
+    # A request diverging inside the generation snapshot is served back to
+    # the sidecar boundary as a sliced prefill-kind snapshot; serving it
+    # consumes the carrier.
+    matched, sliced = cache.lookup([1, 2, 77, 78], key)
+    assert matched == 2
+    assert sliced is not None
+    assert sliced.kind == "prefill"
+    assert sliced.prefix_len == 2
+    assert sliced.token_ids == (1, 2)
+    assert sliced.last_logits is not None
+    assert mx.array_equal(sliced.last_logits, snapshot.sidecar_last_logits).item()
+    assert cache.stats()["sidecar_hits"] == 1
+    assert cache.stats()["generation_consumed"] == 1
+    assert cache.stats()["current_entries"] == 0
+
+
+def test_generation_snapshot_sidecar_skipped_below_min_boundary():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2, 3],
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
+    assert matched == 9
+    assert snapshot is not None
+    assert snapshot.sidecar_boundary == 0
+    assert snapshot.sidecar_gdn_states is None
+    assert snapshot.sidecar_last_logits is None
 
 
 def test_generation_snapshot_skipped_when_request_policy_disallows_it():
@@ -1499,6 +1658,34 @@ def test_copyspec_full_block_copy_skips_draft_backend():
     assert summary.copyspec_tokens == 3
 
 
+def test_draft_without_copyspec_capability_uses_dflash_draft():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_model.capabilities = SimpleNamespace(supports_copyspec=False)
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == [(4, True)]
+    assert draft_backend.advance_context_lengths == []
+    assert summary.copyspec_hits == 0
+    assert summary.copyspec_tokens == 0
+
+
 def test_ddtree_copyspec_full_block_copy_skips_ddtree_draft_backend():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
@@ -1529,6 +1716,27 @@ def test_ddtree_copyspec_full_block_copy_skips_ddtree_draft_backend():
     assert summary.acceptance_history == (3,)
     assert summary.copyspec_hits == 1
     assert summary.copyspec_tokens == 3
+
+
+def test_ddtree_verify_mode_fails_fast_for_unsupported_draft():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_model.capabilities = SimpleNamespace(supports_ddtree=False)
+
+    with pytest.raises(ValueError, match="does not support --verify-mode ddtree"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=_RecordingDraftBackend(),
+                prompt="unused",
+                max_new_tokens=4,
+                prompt_tokens_override=[1, 2],
+                runtime_context=_runtime_context(verify_mode="ddtree"),
+            )
+        )
 
 
 def test_ddtree_copyspec_partial_acceptance_preserves_rollback_snapshot():

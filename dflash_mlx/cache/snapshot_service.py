@@ -12,6 +12,7 @@ import mlx.core as mx
 from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.manager import RuntimeCacheManager, RuntimeCacheManagerClosed
+from dflash_mlx.cache.snapshot import TargetHiddenChunks
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class SnapshotService:
         *,
         token_ids: list[int],
         target_cache: list[Any],
-        target_hidden: mx.array | None,
+        target_hidden: mx.array | TargetHiddenChunks | None,
         last_logits: mx.array | None,
         kind: Literal["prefill", "generation"],
         require_logits: bool,
@@ -95,6 +96,10 @@ class SnapshotService:
         from_snapshot: bool = False,
         snap_prefix_len: int = 0,
         l2_only: bool = False,
+        adopt_cache_arrays: bool = False,
+        sidecar_boundary: int = 0,
+        sidecar_gdn_states: Any = None,
+        sidecar_last_logits: mx.array | None = None,
     ) -> SnapshotPublication | None:
         if target_hidden is None:
             return None
@@ -108,6 +113,10 @@ class SnapshotService:
             last_logits=last_logits,
             kind=kind,
             allow_full_attention_context=allow_full_attention_context,
+            adopt_cache_arrays=adopt_cache_arrays,
+            sidecar_boundary=sidecar_boundary,
+            sidecar_gdn_states=sidecar_gdn_states,
+            sidecar_last_logits=sidecar_last_logits,
         )
         cache_manager = self._cache_manager
         if cache_manager is None:

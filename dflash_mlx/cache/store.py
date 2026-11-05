@@ -34,6 +34,15 @@ class PrefixSnapshotStore:
             "l2_prefill_tokens_saved": 0,
         }
         self._trace_config: TraceConfig | None = None
+        # Updated on every lookup to reflect the source of the last hit.
+        # L1 path: propagated from self._l1.last_hit_kind.
+        # L2 path: set directly in _record_l2_hit().
+        # Readable by RuntimeCacheManager while holding _state_lock.
+        self._last_hit_kind: str = "miss"
+
+    @property
+    def last_hit_kind(self) -> str:
+        return self._last_hit_kind
 
     def set_trace_config(self, trace_config: TraceConfig | None) -> None:
         self._trace_config = trace_config
@@ -50,25 +59,38 @@ class PrefixSnapshotStore:
         key: DFlashPrefixKey,
         *,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
         if self._l2 is None:
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
         matched_len, snapshot = self._l1_lookup(
             req_tuple,
             key,
             record=False,
             request_id=request_id,
+            require_full_coverage=require_full_coverage,
         )
         if snapshot is not None or matched_len > 0:
             if matched_len == len(req_tuple):
-                return self._l1_lookup(req_tuple, key, request_id=request_id)
+                return self._l1_lookup(
+                    req_tuple,
+                    key,
+                    request_id=request_id,
+                    require_full_coverage=require_full_coverage,
+                )
             l2_snapshot = self._l2.lookup(
                 req_tuple,
                 key,
                 min_token_len=matched_len,
+                require_full_coverage=require_full_coverage,
             )
             if l2_snapshot is not None:
                 return self._record_l2_hit(
@@ -80,13 +102,25 @@ class PrefixSnapshotStore:
             else:
                 with self._lock:
                     self._stats["l2_misses"] += 1
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
-        l2_snapshot = self._l2.lookup(req_tuple, key)
+        l2_snapshot = self._l2.lookup(
+            req_tuple, key, require_full_coverage=require_full_coverage
+        )
         if l2_snapshot is None:
             with self._lock:
                 self._stats["l2_misses"] += 1
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
         return self._record_l2_hit(
             l2_snapshot,
@@ -105,8 +139,9 @@ class PrefixSnapshotStore:
     ) -> tuple[int, DFlashPrefixSnapshot]:
         l2_len = len(l2_snapshot.token_ids)
         exact = l2_len == len(req_tuple)
-        promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=True)
-        self._write_snapshots_to_l2(promote.removed_snapshots)
+        if l2_snapshot.kind != "generation":
+            promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=True)
+            self._write_snapshots_to_l2(promote.removed_snapshots)
         with self._lock:
             self._stats["l2_hits"] += 1
             if exact:
@@ -114,10 +149,12 @@ class PrefixSnapshotStore:
             else:
                 self._stats["l2_prefix_hits"] += 1
             self._stats["l2_prefill_tokens_saved"] += int(l2_len)
+        self._last_hit_kind = "l2_exact" if exact else "l2_prefix"
         record_cache_event(
             self._trace_config,
             op="lookup",
             result="l2_hit",
+            hit_kind=self._last_hit_kind,
             request_id=request_id,
             req_tokens=len(req_tuple),
             matched_len=int(l2_len),
@@ -133,12 +170,19 @@ class PrefixSnapshotStore:
         *,
         record: bool = True,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
-        if request_id is None and record:
-            return self._l1.lookup(req_tuple, key)
-        if request_id is None:
-            return self._l1.lookup(req_tuple, key, record=record)
-        return self._l1.lookup(req_tuple, key, record=record, request_id=request_id)
+        kwargs: dict[str, Any] = {}
+        if not record or request_id is not None:
+            kwargs["record"] = record
+        if request_id is not None:
+            kwargs["request_id"] = request_id
+        if require_full_coverage:
+            kwargs["require_full_coverage"] = True
+        result = self._l1.lookup(req_tuple, key, **kwargs)
+        if record:
+            self._last_hit_kind = self._l1.last_hit_kind
+        return result
 
     def insert(self, snapshot: DFlashPrefixSnapshot) -> bool:
         inserted_l2_admitted = False
@@ -203,7 +247,17 @@ class PrefixSnapshotStore:
         if self._l2 is not None:
             self._l2.clear()
 
+    def begin_request(self) -> None:
+        if self._l2 is not None:
+            self._l2.begin_request()
+
+    def end_request(self) -> None:
+        if self._l2 is not None:
+            self._l2.end_request()
+
     def shutdown(self) -> None:
+        if self._l2 is not None:
+            self._write_snapshots_to_l2(self._l1.resident_snapshots())
         self._l1.shutdown()
         if self._l2 is not None:
             self._l2.shutdown(wait=True)

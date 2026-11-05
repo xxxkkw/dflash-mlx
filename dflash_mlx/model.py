@@ -146,11 +146,27 @@ class ContextOnlyDraftKVCache:
 
 
 class FullContextDraftKVCache(ContextOnlyDraftKVCache):
+    # In-place step-grown buffer: a per-cycle concat churns the Metal heap
+    # (progressive ×5 wall at ~7000 cycles).
+    step = 256
+
     def __init__(self):
         super().__init__(sink_size=0, window_size=0)
-        self._key_segments: list[mx.array] = []
-        self._value_segments: list[mx.array] = []
-        self._position_segments: list[mx.array] = []
+        self._length = 0
+
+    def _grow(self, template_keys: mx.array, template_values: mx.array, needed: int) -> None:
+        capacity = ((int(needed) + self.step - 1) // self.step) * self.step
+        batch = int(template_keys.shape[0])
+        heads = int(template_keys.shape[1])
+        key_dim = int(template_keys.shape[3])
+        value_dim = int(template_values.shape[3])
+        new_keys = mx.zeros((batch, heads, capacity, key_dim), dtype=template_keys.dtype)
+        new_values = mx.zeros((batch, heads, capacity, value_dim), dtype=template_values.dtype)
+        if self.keys is not None and self._length > 0:
+            new_keys[:, :, : self._length, :] = self.keys[:, :, : self._length, :]
+            new_values[:, :, : self._length, :] = self.values[:, :, : self._length, :]
+        self.keys = new_keys
+        self.values = new_values
 
     def append_context(
         self,
@@ -164,25 +180,21 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         if context_keys is None or context_values is None or int(num_positions) <= 0:
             return
         append_len = int(context_keys.shape[2])
+        advance = int(advance_positions if advance_positions is not None else num_positions)
         if append_len <= 0:
-            self.offset += int(advance_positions if advance_positions is not None else num_positions)
+            self.offset += advance
             return
-        if positions is None:
-            new_positions = mx.arange(
-                self.offset,
-                self.offset + append_len,
-                dtype=mx.int32,
+        if positions is not None and int(positions.shape[0]) != append_len:
+            raise ValueError(
+                f"positions length {positions.shape[0]} does not match cache append length {append_len}"
             )
-        else:
-            if int(positions.shape[0]) != append_len:
-                raise ValueError(
-                    f"positions length {positions.shape[0]} does not match cache append length {append_len}"
-                )
-            new_positions = positions
-        self._key_segments.append(context_keys)
-        self._value_segments.append(context_values)
-        self._position_segments.append(new_positions)
-        self.offset += int(advance_positions if advance_positions is not None else num_positions)
+        needed = self._length + append_len
+        if self.keys is None or needed > int(self.keys.shape[2]):
+            self._grow(context_keys, context_values, needed)
+        self.keys[:, :, self._length : needed, :] = context_keys
+        self.values[:, :, self._length : needed, :] = context_values
+        self._length = needed
+        self.offset += advance
 
     def context_spans_to_append(self, num_positions: int) -> list[tuple[int, int]]:
         num_positions = int(num_positions)
@@ -191,31 +203,38 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         return [(0, num_positions)]
 
     def fetch(self) -> tuple[Optional[mx.array], Optional[mx.array]]:
-        if not self._key_segments:
+        if self.keys is None or self._length <= 0:
             return None, None
-        if len(self._key_segments) == 1:
-            return self._key_segments[0], self._value_segments[0]
         return (
-            mx.concatenate(self._key_segments, axis=2),
-            mx.concatenate(self._value_segments, axis=2),
+            self.keys[:, :, : self._length, :],
+            self.values[:, :, : self._length, :],
         )
 
-    def segments(self) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...], tuple[mx.array, ...]]:
+    def fetch_with_block(
+        self,
+        block_keys: mx.array,
+        block_values: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        block_len = int(block_keys.shape[2])
+        if self.keys is None or self._length <= 0:
+            return block_keys, block_values
+        needed = self._length + block_len
+        if needed > int(self.keys.shape[2]):
+            self._grow(block_keys, block_values, needed)
+        self.keys[:, :, self._length : needed, :] = block_keys
+        self.values[:, :, self._length : needed, :] = block_values
         return (
-            tuple(self._key_segments),
-            tuple(self._value_segments),
-            tuple(self._position_segments),
+            self.keys[:, :, :needed, :],
+            self.values[:, :, :needed, :],
         )
 
     def position_indices(self) -> Optional[mx.array]:
-        if not self._position_segments:
+        if self._length <= 0:
             return None
-        if len(self._position_segments) == 1:
-            return self._position_segments[0]
-        return mx.concatenate(self._position_segments, axis=0)
+        return mx.arange(self._length, dtype=mx.int32)
 
     def cache_length(self) -> int:
-        return sum(int(segment.shape[2]) for segment in self._key_segments)
+        return self._length
 
 
 @dataclass
@@ -264,6 +283,19 @@ class DFlashDraftModelArgs:
                 data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
         data["layer_types"] = layer_types
         data["dflash_config"] = dict(data.get("dflash_config") or {})
+        if "block_size" not in data:
+            nested_block_size = data["dflash_config"].get("block_size")
+            if nested_block_size is not None:
+                data["block_size"] = nested_block_size
+        if "rope_theta" not in data:
+            rope_parameters = data.get("rope_parameters") or {}
+            if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+                data["rope_theta"] = rope_parameters["rope_theta"]
+            elif (
+                isinstance(data.get("rope_scaling"), dict)
+                and "rope_theta" in data["rope_scaling"]
+            ):
+                data["rope_theta"] = data["rope_scaling"]["rope_theta"]
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
@@ -292,6 +324,16 @@ class DFlashDraftModelArgs:
         if "sliding_attention" in layer_types and int(self.sliding_window or 0) <= 0:
             raise ValueError("sliding_attention draft layers require a positive sliding_window")
         self.layer_types = layer_types
+
+
+@dataclass(frozen=True)
+class DraftRuntimeCapabilities:
+    default_block_tokens: int
+    max_block_tokens: int
+    supports_copyspec: bool = True
+    supports_ddtree: bool = True
+    supports_early_rollback_launch: bool = True
+
 
 class DFlashAttention(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs, layer_idx: int):
@@ -353,14 +395,28 @@ class DFlashAttention(nn.Module):
 
     def _context_segments_for_cache(
         self,
-        target_hidden: mx.array,
+        target_hidden: Any,
         cache: Any,
     ) -> tuple[mx.array, list[tuple[int, int]]]:
+        from dflash_mlx.cache.snapshot import TargetHiddenChunks
+
+        is_chunks = isinstance(target_hidden, TargetHiddenChunks)
+        total_len = int(target_hidden.shape[1])
         if not isinstance(cache, ContextOnlyDraftKVCache):
-            return target_hidden, [(0, int(target_hidden.shape[1]))]
-        spans = cache.context_spans_to_append(int(target_hidden.shape[1]))
+            if is_chunks:
+                return target_hidden.slice(0, total_len), [(0, total_len)]
+            return target_hidden, [(0, total_len)]
+        spans = cache.context_spans_to_append(total_len)
         if not spans:
+            if is_chunks:
+                return target_hidden.slice(0, 0), []
             return target_hidden[:, :0, :], []
+        if is_chunks:
+            pieces = [target_hidden.slice(start, end) for start, end in spans]
+            return (
+                pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=1),
+                spans,
+            )
         if len(spans) == 1:
             start, end = spans[0]
             return target_hidden[:, start:end, :], spans
@@ -496,19 +552,7 @@ class DFlashAttention(nn.Module):
                     positions=context_positions,
                     advance_positions=ctx_len,
                 )
-                key_segments, value_segments, position_segments = cache.segments()
-                key_parts = [*key_segments, noise_keys]
-                value_parts = [*value_segments, noise_values]
-                keys = (
-                    key_parts[0]
-                    if len(key_parts) == 1
-                    else mx.concatenate(key_parts, axis=-2)
-                )
-                values = (
-                    value_parts[0]
-                    if len(value_parts) == 1
-                    else mx.concatenate(value_parts, axis=-2)
-                )
+                keys, values = cache.fetch_with_block(noise_keys, noise_values)
                 mask = None
                 if self.sliding_window is not None:
                     noise_positions = mx.arange(
@@ -516,11 +560,11 @@ class DFlashAttention(nn.Module):
                         query_offset + block_len,
                         dtype=mx.int32,
                     )
-                    position_parts = [*position_segments, noise_positions]
+                    cached_positions = cache.position_indices()
                     key_positions = (
-                        position_parts[0]
-                        if len(position_parts) == 1
-                        else mx.concatenate(position_parts, axis=0)
+                        noise_positions
+                        if cached_positions is None
+                        else mx.concatenate([cached_positions, noise_positions], axis=0)
                     )
                     mask = self._attention_mask(
                         block_len=block_len,
@@ -675,15 +719,13 @@ class DFlashDecoderLayer(nn.Module):
             cache=cache,
         )
 
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs):
         super().__init__()
         self.args = args
         self.model_type = "dflash_qwen3"
-        self.layers = [
-            DFlashDecoderLayer(args, layer_idx)
-            for layer_idx in range(args.num_hidden_layers)
-        ]
+        self.layers = self._build_layers(args)
         target_layer_ids = list((args.dflash_config or {}).get("target_layer_ids") or ())
         self.target_layer_ids = target_layer_ids or build_target_layer_ids(
             args.num_target_layers,
@@ -695,6 +737,16 @@ class DFlashDraftModel(nn.Module):
         self.block_size = int(args.block_size)
         self.mask_token_id = int((args.dflash_config or {}).get("mask_token_id", 0) or 0)
         self.embed_scale = 1.0
+        self.capabilities = DraftRuntimeCapabilities(
+            default_block_tokens=self.block_size,
+            max_block_tokens=self.block_size,
+        )
+
+    def _build_layers(self, args: DFlashDraftModelArgs) -> list[nn.Module]:
+        return [
+            DFlashDecoderLayer(args, layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
+        ]
 
     def bind_target_model(self, target_model: Any, *, target_ops: Any) -> None:
         text_model = target_ops.text_model(target_model)

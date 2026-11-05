@@ -30,7 +30,10 @@ from dflash_mlx.cache.manager import (
 from dflash_mlx.diagnostics import DiagnosticsConfig
 from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
 from dflash_mlx.observability.memory import live_memory_payload
-from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+from dflash_mlx.server.prefix_cache_manager import (
+    build_prefix_key,
+    build_runtime_cache_identity,
+)
 
 _LIVE_LOCK = threading.Lock()
 _LIVE_STARTED_AT = time.time()
@@ -102,6 +105,7 @@ class _RequestAccounting:
     finish_reason: Optional[str] = None
     cache_lookup_ms: Optional[float] = None
     cache_hit_tokens: int = 0
+    hit_kind: str = "miss"
     cache_insert_ms: Optional[float] = None
     cache_lookup_stats: Optional[dict[str, Any]] = None
     prompt_regime: Optional[dict[str, Any]] = None
@@ -240,6 +244,7 @@ class _RequestAccounting:
             else None
         )
         fallback_used = bool(summary_event.fallback_ar if summary_event else False)
+        hit_kind = str(summary_event.hit_kind if summary_event is not None else "miss")
         return cls(
             request_id=int(request_id),
             mode_used="dflash_fallback" if fallback_used else "dflash",
@@ -267,6 +272,7 @@ class _RequestAccounting:
             max_tokens=int(max_tokens),
             cache_lookup_ms=float(cache_lookup_ms),
             cache_hit_tokens=int(cache_hit_tokens),
+            hit_kind=hit_kind,
             cache_insert_ms=float(cache_insert_ms),
             cache_lookup_stats=dict(cache_lookup_stats or {}),
             prompt_regime=dict(prompt_regime or {}),
@@ -329,6 +335,7 @@ class _RequestAccounting:
             copyspec_tokens=self.copyspec_tokens,
             finish_reason=self.finish_reason,
             cache_hit_tokens=self.cache_hit_tokens,
+            hit_kind=self.hit_kind,
             prefill_phase_timings_us=self.prefill_phase_timings_us,
             phase_timings_us=self.phase_timings_us,
         )
@@ -350,6 +357,7 @@ class _RequestAccounting:
             "wall_ms": float(self.wall_ms),
             "cache_hit_tokens": int(self.cache_hit_tokens),
             "cache_status": _cache_status(self.cache_hit_tokens),
+            "hit_kind": self.hit_kind,
         }
         if self.prompt_tokens is None:
             return payload
@@ -413,7 +421,11 @@ def configure_live_metrics(
         and int(target_fa_window or 0) <= 0
     )
     runtime_context = getattr(cli_args, "runtime_context", None)
-    cache_identity: Any = tuple(model_key)
+    cache_identity: Any = (
+        build_runtime_cache_identity(model_provider)
+        if runtime_context is not None
+        else tuple(model_key)
+    )
     draft_model = getattr(model_provider, "draft_model", None)
     if prefix_cache_enabled and runtime_context is not None and draft_model is not None:
         cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
@@ -517,6 +529,7 @@ def start_live_request(
     max_tokens: int,
     cache_hit_tokens: int = 0,
     cache_lookup_ms: float = 0.0,
+    hit_kind: str = "miss",
 ) -> None:
     current = {
         "request_id": int(request_id),
@@ -527,6 +540,7 @@ def start_live_request(
         "generated_tokens": 0,
         "cache_hit_tokens": int(cache_hit_tokens),
         "cache_status": _cache_status(cache_hit_tokens),
+        "hit_kind": str(hit_kind),
         "cache_lookup_ms": float(cache_lookup_ms),
         "prefill_tokens_processed": None,
         "prefill_tokens_total": _int_or_none(prompt_tokens),
@@ -1038,6 +1052,7 @@ def _last_request_payload(
     copyspec_tokens: int,
     finish_reason: Optional[str],
     cache_hit_tokens: int = 0,
+    hit_kind: str = "miss",
     prefill_phase_timings_us: Optional[dict[str, float]] = None,
     phase_timings_us: Optional[dict[str, float]] = None,
 ) -> dict[str, Any]:
@@ -1067,6 +1082,7 @@ def _last_request_payload(
         "finish_reason": finish_reason,
         "cache_hit_tokens": int(cache_hit_tokens),
         "cache_status": _cache_status(cache_hit_tokens),
+        "hit_kind": str(hit_kind),
         "prefill_phase_timings_us": dict(prefill_phase_timings_us or {}),
         "phase_timings_us": dict(phase_timings_us or {}),
     }

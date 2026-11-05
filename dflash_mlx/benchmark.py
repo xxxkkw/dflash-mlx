@@ -5,6 +5,7 @@
 import argparse
 import gc
 import hashlib
+import json
 import platform
 import re
 import shlex
@@ -90,8 +91,10 @@ CONTROLLED_FLAG_NAMES = (
     "target_fa_window",
     "draft_sink_size",
     "draft_window_size",
+    "draft_full_context_min_ctx",
     "verify_len_cap",
     "verify_mode",
+    "copyspec_mode",
     "only_dflash",
     "out",
 )
@@ -510,8 +513,10 @@ def _build_config(
     target_fa_window: int,
     draft_sink_size: int,
     draft_window_size: int,
+    draft_full_context_min_ctx: int,
     verify_len_cap: int,
     verify_mode: str,
+    copyspec_mode: str,
     only_dflash: bool,
 ) -> dict[str, Any]:
     return {
@@ -530,8 +535,10 @@ def _build_config(
         "target_fa_window": int(target_fa_window),
         "draft_sink_size": int(draft_sink_size),
         "draft_window_size": int(draft_window_size),
+        "draft_full_context_min_ctx": int(draft_full_context_min_ctx),
         "verify_len_cap": int(verify_len_cap),
         "verify_mode": str(verify_mode),
+        "copyspec_mode": str(copyspec_mode),
         "only_dflash": bool(only_dflash),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
@@ -545,24 +552,30 @@ def _offline_runtime_values(
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> dict[str, Any]:
     cfg = build_offline_runtime_config(
         prefill_step_size=prefill_step_size,
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        draft_full_context_min_ctx=draft_full_context_min_ctx,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return {
         "prefill_step_size": int(cfg.prefill_step_size),
         "target_fa_window": int(cfg.target_fa_window),
         "draft_sink_size": int(cfg.draft_sink_size),
         "draft_window_size": int(cfg.draft_window_size),
+        "draft_full_context_min_ctx": int(cfg.draft_full_context_min_ctx),
         "verify_len_cap": int(cfg.verify_len_cap),
         "verify_mode": str(cfg.verify_mode),
+        "copyspec_mode": str(cfg.copyspec_mode),
     }
 
 def _build_single_case_report(
@@ -584,8 +597,10 @@ def _build_single_case_report(
     target_fa_window: int,
     draft_sink_size: int,
     draft_window_size: int,
+    draft_full_context_min_ctx: int,
     verify_len_cap: int,
     verify_mode: str,
+    copyspec_mode: str,
     only_dflash: bool,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
@@ -651,8 +666,10 @@ def _build_single_case_report(
             target_fa_window=target_fa_window,
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
+            draft_full_context_min_ctx=draft_full_context_min_ctx,
             verify_len_cap=verify_len_cap,
             verify_mode=verify_mode,
+            copyspec_mode=copyspec_mode,
             only_dflash=only_dflash,
         ),
         "runs": run_entries,
@@ -1015,8 +1032,10 @@ def _run_once_sequential(
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     expected_answer: str | None = None,
     cooldown: int = 0,
     only_dflash: bool = False,
@@ -1071,8 +1090,10 @@ def _run_once_sequential(
             target_fa_window=target_fa_window,
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
+            draft_full_context_min_ctx=draft_full_context_min_ctx,
             verify_len_cap=verify_len_cap,
             verify_mode=verify_mode,
+            copyspec_mode=copyspec_mode,
         )
         bundle = load_runtime_bundle(
             model_ref=target_model_ref,
@@ -1188,8 +1209,10 @@ def benchmark_once(
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     cooldown: int = 10,
     expected_answer: str | None = None,
     only_dflash: bool = False,
@@ -1199,8 +1222,10 @@ def benchmark_once(
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        draft_full_context_min_ctx=draft_full_context_min_ctx,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     thermal_pressure = _get_thermal_pressure()
     _warn_if_throttled(thermal_pressure)
@@ -1256,8 +1281,10 @@ def benchmark_repeated(
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     cooldown: int = 10,
     expected_answer: str | None = None,
     only_dflash: bool = False,
@@ -1267,8 +1294,10 @@ def benchmark_repeated(
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        draft_full_context_min_ctx=draft_full_context_min_ctx,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     target_meta: dict[str, Any] | None = None
     draft_meta: dict[str, Any] | None = None
@@ -1330,6 +1359,146 @@ def benchmark_repeated(
         **runtime_values,
     )
 
+def _sustained_summary(gens: list[dict[str, Any]]) -> dict[str, Any]:
+    if not gens:
+        return {"generations": 0}
+    fresh = float(gens[0]["decode_tok_s"])
+    total_s = float(gens[-1]["t_start_s"]) + float(gens[-1]["wall_s"])
+    plateau_start = max(300.0, total_s - 300.0)
+    plateau_rows = [g for g in gens if float(g["t_start_s"]) >= plateau_start]
+    plateau = (
+        sum(float(g["decode_tok_s"]) for g in plateau_rows) / len(plateau_rows)
+        if plateau_rows
+        else None
+    )
+    cliff_s = None
+    for g in gens:
+        if float(g["decode_tok_s"]) < 0.8 * fresh:
+            cliff_s = float(g["t_start_s"])
+            break
+    out: dict[str, Any] = {
+        "generations": len(gens),
+        "elapsed_s": round(total_s, 1),
+        "fresh_tok_s": round(fresh, 2),
+        "cliff_s": round(cliff_s, 1) if cliff_s is not None else None,
+    }
+    if plateau is not None:
+        out["plateau_tok_s"] = round(plateau, 2)
+        out["throttle_factor"] = round(fresh / plateau, 3) if plateau > 0 else None
+    return out
+
+
+def _sustained_summary_markdown(result: dict[str, Any]) -> str:
+    s = result.get("sustained", {})
+    cfg = result.get("config", {})
+    lines = [
+        "# DFlash sustained benchmark",
+        "",
+        f"- model: {cfg.get('model')}",
+        f"- draft: {cfg.get('draft')}",
+        f"- minutes: {cfg.get('sustained_minutes')}",
+        f"- generations: {s.get('generations')}  (elapsed {s.get('elapsed_s')}s)",
+        f"- fresh decode: {s.get('fresh_tok_s')} tok/s",
+        f"- plateau decode (last 5 min): {s.get('plateau_tok_s')} tok/s",
+        f"- throttle factor (fresh/plateau): {s.get('throttle_factor')}",
+        f"- cliff onset (first gen < 0.8x fresh): {s.get('cliff_s')}s",
+        "",
+        "| gen | t_start_s | decode_tok_s | tokens | tpc |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for g in result.get("runs", []):
+        lines.append(
+            f"| {g['gen_index']} | {g['t_start_s']:.0f} | {g['decode_tok_s']:.1f} "
+            f"| {g['generation_tokens']} | {g.get('tokens_per_cycle', 0.0):.2f} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def benchmark_sustained(
+    *,
+    prompt: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Continuous-load leg: one bundle, back-to-back generations for N minutes.
+
+    Single-run benchmarks measure the fresh-GPU regime only; sustained decode
+    settles at the power-envelope plateau (measured 1.5-1.8x slower on M5 Max
+    after ~3 min). This reports both regimes plus the cliff onset.
+    """
+    minutes = float(args.sustained_minutes)
+    if minutes <= 0:
+        raise ValueError("--sustained-minutes must be > 0")
+    runtime_values = _offline_runtime_values(
+        prefill_step_size=args.prefill_step_size,
+        target_fa_window=args.target_fa_window,
+        draft_sink_size=args.draft_sink_size,
+        draft_window_size=args.draft_window_size,
+        draft_full_context_min_ctx=args.draft_full_context_min_ctx,
+        verify_len_cap=args.verify_len_cap,
+        verify_mode=args.verify_mode,
+        copyspec_mode=args.copyspec_mode,
+    )
+    runtime_context = build_offline_runtime_context(**runtime_values)
+    bundle = load_runtime_bundle(
+        model_ref=args.model,
+        draft_ref=args.draft,
+        draft_quant=args.draft_quant,
+        verify_config=runtime_context.verify,
+    )
+    eos_token_ids = get_stop_token_ids(bundle.tokenizer)
+    stop_token_ids = [] if args.no_eos else eos_token_ids
+    suppress_token_ids = eos_token_ids if args.no_eos else None
+    gens: list[dict[str, Any]] = []
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < minutes * 60.0:
+        t_start = time.perf_counter() - t0
+        payload = _generate_dflash_stream_once(
+            target_model=bundle.target_model,
+            target_ops=bundle.target_ops,
+            tokenizer=bundle.tokenizer,
+            draft_model=bundle.draft_model,
+            draft_backend=bundle.draft_backend,
+            prompt=prompt,
+            max_new_tokens=args.max_tokens,
+            use_chat_template=not args.no_chat_template,
+            block_tokens=args.block_tokens,
+            stop_token_ids=stop_token_ids,
+            suppress_token_ids=suppress_token_ids,
+            runtime_context=runtime_context,
+        )
+        wall_s = (time.perf_counter() - t0) - t_start
+        prefill_us = float(dict(payload.get("phase_timings_us", {})).get("prefill", 0.0))
+        decode_s = max(float(payload.get("elapsed_us", 0.0)) - prefill_us, 1.0) / 1e6
+        tokens = int(payload.get("generation_tokens", 0))
+        gens.append(
+            {
+                "gen_index": len(gens),
+                "t_start_s": round(t_start, 2),
+                "wall_s": round(wall_s, 2),
+                "generation_tokens": tokens,
+                "decode_tok_s": round(tokens / decode_s, 2),
+                "tokens_per_cycle": float(payload.get("tokens_per_cycle", 0.0)),
+                "acceptance_ratio": float(payload.get("acceptance_ratio", 0.0)),
+                "thermal_pressure": _get_thermal_pressure(),
+            }
+        )
+    target_meta = bundle.target_meta or {}
+    draft_meta = bundle.draft_meta or {}
+    return {
+        "config": {
+            "model": target_meta.get("resolved_model_ref", args.model),
+            "draft": draft_meta.get("resolved_model_ref", args.draft),
+            "sustained_minutes": minutes,
+            "max_tokens": int(args.max_tokens),
+            "block_tokens": args.block_tokens,
+            "suite": "sustained",
+            **runtime_values,
+        },
+        "sustained": _sustained_summary(gens),
+        "runs": gens,
+    }
+
+
 def benchmark_suite(
     *,
     prompts: list[BenchmarkPrompt],
@@ -1349,6 +1518,7 @@ def benchmark_suite(
         "draft_window_size": args.draft_window_size,
         "verify_len_cap": args.verify_len_cap,
         "verify_mode": args.verify_mode,
+        "copyspec_mode": args.copyspec_mode,
         "cooldown": args.cooldown,
         "only_dflash": bool(args.only_dflash),
     }
@@ -1469,6 +1639,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Sleep between baseline/DFlash legs and repeated measured runs. Default: 10.",
     )
     parser.add_argument(
+        "--sustained-minutes",
+        metavar="MINUTES",
+        type=float,
+        default=None,
+        help=(
+            "Continuous-load mode: one model load, back-to-back DFlash "
+            "generations for N minutes; reports fresh vs plateau decode tok/s "
+            "and the throttle cliff onset. Default: disabled."
+        ),
+    )
+    parser.add_argument(
         "--wired-limit",
         metavar="auto|none|BYTES",
         type=parse_memory_limit,
@@ -1567,6 +1748,7 @@ def _controlled_flag_values(
         "draft_window_size": int(args.draft_window_size),
         "verify_len_cap": int(args.verify_len_cap),
         "verify_mode": str(args.verify_mode),
+        "copyspec_mode": str(args.copyspec_mode),
         "only_dflash": bool(args.only_dflash),
         "out": str(output_path),
     }
@@ -1603,6 +1785,7 @@ def _explicit_flag_values(
         "--draft-window-size": "draft_window_size",
         "--verify-len-cap": "verify_len_cap",
         "--verify-mode": "verify_mode",
+        "--copyspec-mode": "copyspec_mode",
         "--only-dflash": "only_dflash",
         "--out": "out",
     }
@@ -1657,6 +1840,31 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         _benchmark_label(args),
         explicit_path=args.out,
     )
+    if args.sustained_minutes is not None:
+        try:
+            result = benchmark_sustained(prompt=prompts[0].prompt, args=args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        command_argv = (
+            [prog or "dflash benchmark", *argv_list] if argv is not None else list(sys.argv)
+        )
+        manifest = write_manifest(
+            output_path,
+            kind="benchmark",
+            label=_benchmark_label(args),
+            argv=command_argv,
+            model=result["config"].get("model"),
+            draft=result["config"].get("draft"),
+            effective_config=result["config"],
+        )
+        manifest["benchmark_summary"] = result.get("sustained")
+        write_json(output_path / "manifest.json", manifest)
+        write_json(output_path / "results.json", result)
+        write_jsonl(output_path / "runs.jsonl", list(result.get("runs", [])))
+        (output_path / "summary.md").write_text(_sustained_summary_markdown(result))
+        print(json.dumps(result.get("sustained", {}), indent=2))
+        print(f"\nArtifacts: {output_path}")
+        return
     try:
         result = benchmark_suite(prompts=prompts, args=args)
     except ValueError as exc:

@@ -22,6 +22,7 @@ from dflash_mlx.cache.prefix_l2 import (
     L2_SCHEMA_VERSION,
     DFlashPrefixL2Cache,
     _deserialize,
+    _fingerprint,
     _format_filename,
     _key_hash,
     _runtime_layout_hash,
@@ -31,11 +32,15 @@ from dflash_mlx.cache.prefix_l2 import (
 )
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.diagnostics import TraceConfig
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from tests.test_prefix_cache import (
     _make_full_hidden_snapshot,
+    _make_gdn_cache_populated,
     _make_key,
+    _make_kv_cache_populated,
     _make_rotating_cache_populated,
     _make_synthetic_snapshot,
+    _make_trimmed_snapshot,
 )
 
 def _all_snapshot_files(cache_dir: Path) -> list[Path]:
@@ -121,6 +126,17 @@ def _wait_writes(l2: DFlashPrefixL2Cache, expected: int, timeout_s: float = 5.0)
         time.sleep(0.05)
     raise AssertionError(
         f"L2 writer did not catch up: writes={l2.stats()['writes']} expected>={expected}"
+    )
+
+def _wait_files(cache_dir: Path, expected: int, timeout_s: float = 10.0) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if len(_all_snapshot_files(cache_dir)) >= expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"L2 files did not land: have={len(_all_snapshot_files(cache_dir))} "
+        f"expected>={expected}"
     )
 
 def _insert_l2_sync(l2: DFlashPrefixL2Cache, snap) -> None:
@@ -248,13 +264,15 @@ class TestL2Lifecycle:
         assert "l2" not in stats
 
     def test_evict_promotes_to_l2_disk(self, tmp_path):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        # 3 slots: the eviction-promotion duplicate makes a third overlapping
+        # insert; wait on files, not the dedup-inflated writes counter.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=3)
         try:
             cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
-            _wait_writes(l2, expected=2)
+            _wait_files(tmp_path, expected=2)
             assert len(_all_snapshot_files(tmp_path)) == 2
         finally:
             l2.shutdown()
@@ -364,6 +382,81 @@ class TestL2Lifecycle:
             assert cache.stats()["l2_hits"] == 2
         finally:
             l2.shutdown()
+
+    def test_l2_generation_prefix_hit_is_not_promoted_to_l1(self, tmp_path):
+        # Generation snapshots are consume-on-serve; promoting one to L1
+        # would pin its arrays for a hit that can never come. Repeat
+        # lookups fall back to L2, which keeps serving the file.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+            snap.last_logits = None
+            _insert_l2_sync(l2, snap)
+            cache = PrefixSnapshotStore(
+                l1=DFlashPrefixCache(
+                    max_entries=4,
+                    max_bytes=10**9,
+                    max_snapshot_tokens=3,
+                ),
+                l2=l2,
+            )
+
+            matched, hydrated = cache.lookup([7, 8, 9, 10, 11], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["current_entries"] == 0
+            assert stats["skipped_too_long"] == 0
+
+            cache.lookup([7, 8, 9, 10, 12], key)
+            assert cache.stats()["l2_hits"] == 2
+        finally:
+            l2.shutdown()
+
+    def test_store_shutdown_spills_resident_l1_to_l2(self, tmp_path):
+        # Consume-on-serve keeps generation snapshots out of L2 during the
+        # session; the shutdown spill is the only bridge to the next session.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        key = _make_key()
+        snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+        snap.last_logits = None
+        cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+        cache.insert(snap)
+        assert _all_snapshot_files(tmp_path) == []
+
+        cache.shutdown()
+
+        assert len(_all_snapshot_files(tmp_path)) == 1
+        l2_reopened = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            fresh = _store(max_entries=4, max_bytes=10**9, l2=l2_reopened)
+            matched, hydrated = fresh.lookup([7, 8, 9, 10, 11], key)
+            assert matched == 4
+            assert hydrated is not None
+            assert fresh.stats()["l2_hits"] == 1
+            assert fresh.stats()["current_entries"] == 0
+        finally:
+            l2_reopened.shutdown()
+
+    def test_store_shutdown_spill_skips_already_written_file(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        key = _make_key()
+        snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+        snap.last_logits = None
+        cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+        cache.insert(snap)
+        _insert_l2_sync(l2, snap)
+        assert len(_all_snapshot_files(tmp_path)) == 1
+
+        cache.shutdown()
+
+        # "writes" counts admitted inserts including dedup-skips; the spill
+        # must not produce a second physical file.
+        assert len(_all_snapshot_files(tmp_path)) == 1
+        assert l2.stats()["writes"] == 2
 
     def test_l2_prefix_hit_promotes_to_l1(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
@@ -968,7 +1061,9 @@ class TestEpochInvalidation:
 
             l2.clear()
 
-            payload = l2._write_queue.get_nowait()
+            job = l2._write_queue.get_nowait()
+            # _write_payload checks epoch; simulate what the writer thread does
+            payload = l2._write_job_to_disk(job)
             l2._write_payload(payload)
 
             assert _all_snapshot_files(tmp_path) == []
@@ -1173,7 +1268,9 @@ class TestStatsHotPath:
             l2.shutdown()
 
 class TestAsyncWriterSafety:
-    def test_async_writer_does_not_call_mx_save_safetensors(self, tmp_path, monkeypatch):
+    def test_insert_async_does_not_call_mx_save_safetensors(self, tmp_path, monkeypatch):
+        """insert_async must not call mx.save_safetensors on the caller thread.
+        The disk write is deferred to the writer thread via _WriteJob."""
         import mlx.core as _mx
 
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
@@ -1195,12 +1292,307 @@ class TestAsyncWriterSafety:
             key = _make_key()
             l2.insert_async(_make_synthetic_snapshot([1, 2, 3], key))
             assert l2._write_queue.qsize() == 1
-            assert calls["n"] == 1
-            assert "dflash-l2-writer" not in threads
+            # save_safetensors must NOT have been called on the request thread
+            assert calls["n"] == 0, (
+                f"insert_async called mx.save_safetensors {calls['n']} times — "
+                "disk write should be deferred to the writer thread"
+            )
 
-            payload = l2._write_queue.get_nowait()
+            # Now simulate the writer thread processing the job
+            job = l2._write_queue.get_nowait()
+            payload = l2._write_job_to_disk(job)
             l2._write_payload(payload)
             assert calls["n"] == 1
             assert len(_all_snapshot_files(tmp_path)) == 1
         finally:
             l2.shutdown()
+
+class TestL2WriteGate:
+    def test_begin_request_holds_writes_until_last_end_request(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            l2.begin_request()
+            l2.begin_request()
+            assert l2.insert_async(_make_synthetic_snapshot([1, 2, 3], _make_key())) is True
+            time.sleep(0.8)
+            assert l2.stats()["writes"] == 0
+            assert _all_snapshot_files(tmp_path) == []
+            l2.end_request()
+            time.sleep(0.8)
+            assert l2.stats()["writes"] == 0, (
+                "gate must stay closed while another request is active"
+            )
+            l2.end_request()
+            _wait_writes(l2, expected=1)
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_shutdown_flushes_pending_writes_while_gated(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            l2.begin_request()
+            assert l2.insert_async(_make_synthetic_snapshot([1, 2, 3], _make_key())) is True
+            l2.shutdown()
+            assert l2.stats()["writes"] == 1
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_request_brackets_forward_and_tolerate_retirement(self, tmp_path):
+        from dflash_mlx.cache.manager import RuntimeCacheManager
+
+        no_l2 = PrefixSnapshotStore(
+            l1=DFlashPrefixCache(max_entries=2, max_bytes=10**9),
+            l2=None,
+        )
+        no_l2.begin_request()
+        no_l2.end_request()
+
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        manager = RuntimeCacheManager(_store(l2=l2))
+        try:
+            manager.begin_request()
+            assert not l2._write_gate.is_set()
+            manager.end_request()
+            assert l2._write_gate.is_set()
+        finally:
+            manager.shutdown()
+        manager.begin_request()
+        manager.end_request()
+
+class TestSidecarRoundTrip:
+    def test_serialize_roundtrip_preserves_sidecar(self):
+        from tests.test_prefix_cache import _make_sidecar_generation_snapshot
+
+        snap = _make_sidecar_generation_snapshot(
+            [1, 2, 3, 4, 5, 6, 7, 8], 5, _make_key()
+        )
+        arrays, meta_dict = _serialize(snap)
+        loaded = _deserialize(arrays, json.loads(meta_dict["dflash_meta"]))
+        assert loaded.sidecar_boundary == 5
+        assert loaded.sidecar_last_logits is not None
+        assert mx.array_equal(
+            loaded.sidecar_last_logits, snap.sidecar_last_logits
+        ).item()
+        assert loaded.sidecar_gdn_states[0] is None
+        for got, want in zip(loaded.sidecar_gdn_states[1], snap.sidecar_gdn_states[1]):
+            if want is None:
+                assert got is None
+                continue
+            assert mx.array_equal(got, want).item()
+        from dflash_mlx.cache.codecs import slice_snapshot_at_sidecar_boundary
+
+        sliced = slice_snapshot_at_sidecar_boundary(loaded)
+        assert sliced.token_ids == snap.token_ids[:5]
+
+    def test_fingerprint_distinguishes_sidecar_twin(self):
+        from tests.test_prefix_cache import _make_sidecar_generation_snapshot
+
+        key = _make_key()
+        with_sidecar = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
+        plain = _make_synthetic_snapshot([1, 2, 3, 4, 5, 6], key, kind="generation")
+        assert _fingerprint(with_sidecar) != _fingerprint(plain)
+
+class TestCoverageFilterL2:
+    def test_lookup_rejects_trimmed_on_metadata_before_eval(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(100)), key))
+
+            def _no_eval(_arrays):
+                raise AssertionError(
+                    "coverage reject must happen before array eval"
+                )
+
+            monkeypatch.setattr("dflash_mlx.cache.prefix_l2._eval_arrays", _no_eval)
+
+            assert l2.lookup(tuple(range(100)), key, require_full_coverage=True) is None
+            stats = l2.stats()
+            assert stats["coverage_rejects"] == 1
+            assert stats["lookup_loads"] == 1
+            assert stats["misses"] == 1
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_trimmed_file_still_serves_windowed_requests(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(100)), key))
+
+            snap = l2.lookup(tuple(range(100)), key)
+            assert snap is not None
+            assert snap.token_ids == tuple(range(100))
+            assert l2.stats()["coverage_rejects"] == 0
+        finally:
+            l2.shutdown()
+
+    def test_coverage_reject_keeps_scanning_to_shorter_covering_file(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(60)), key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(list(range(30)), key))
+
+            snap = l2.lookup(tuple(range(60)), key, require_full_coverage=True)
+            assert snap is not None
+            assert snap.token_ids == tuple(range(30))
+            stats = l2.stats()
+            assert stats["coverage_rejects"] == 1
+            assert stats["hits"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_full_twin_coexists_with_trimmed_file_and_serves_full_context(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            _insert_l2_sync(l2, _make_trimmed_snapshot(tokens, key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(tokens, key))
+
+            assert len(_all_snapshot_files(tmp_path)) == 2
+
+            snap = l2.lookup(tuple(tokens), key, require_full_coverage=True)
+            assert snap is not None
+            assert snapshot_covers_prefix(snap, len(tokens))
+        finally:
+            l2.shutdown()
+
+    def test_fingerprint_distinguishes_trimmed_and_full_twins(self):
+        key = _make_key()
+        tokens = list(range(100))
+        trimmed = _make_trimmed_snapshot(tokens, key)
+        full = _make_synthetic_snapshot(tokens, key)
+        assert trimmed.token_ids == full.token_ids
+        assert trimmed.kind == full.kind
+        assert _fingerprint(trimmed) != _fingerprint(full)
+
+    def test_store_lookup_demotes_trimmed_l1_and_hits_covering_l2(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(tokens, key))
+            store = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            store.insert(_make_trimmed_snapshot(tokens, key))
+            _wait_writes(l2, expected=2)
+
+            matched, snap = store.lookup(tokens, key, require_full_coverage=True)
+            assert matched == 100
+            assert snap is not None
+            assert snapshot_covers_prefix(snap, 100)
+            assert store.stats()["l2_hits"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_store_l2_miss_fallback_keeps_coverage_filter(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            l1 = DFlashPrefixCache(max_entries=4, max_bytes=10**9)
+            l1.insert(_make_trimmed_snapshot(tokens, key))
+            store = PrefixSnapshotStore(l1=l1, l2=l2)
+
+            matched, snap = store.lookup(
+                tokens + [999], key, require_full_coverage=True
+            )
+            assert matched == 0
+            assert snap is None
+
+            matched, snap = store.lookup(tokens + [999], key)
+            assert matched == 100
+            assert snap is not None
+        finally:
+            l2.shutdown()
+
+
+class TestEvictionLruOnHit:
+    def test_hit_refreshes_mtime_so_eviction_spares_served_file(self, tmp_path):
+        import os
+
+        key = _make_key()
+        served = _make_synthetic_snapshot([1, 2, 3], key)
+        idle = _make_synthetic_snapshot([7, 8, 9, 10], key)
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=2)
+        try:
+            _insert_l2_sync(l2, served)
+            _insert_l2_sync(l2, idle)
+            served_path = l2._final_path_for(served)
+            idle_path = l2._final_path_for(idle)
+            assert served_path.exists() and idle_path.exists()
+
+            # Backdate both files: `served` written first, `idle` second.
+            os.utime(served_path, ns=(10**9, 10**9))
+            os.utime(idle_path, ns=(2 * 10**9, 2 * 10**9))
+
+            hit = l2.lookup((1, 2, 3), key)
+            assert hit is not None
+            assert served_path.stat().st_mtime_ns > idle_path.stat().st_mtime_ns
+
+            served_size = served_path.stat().st_size
+            idle_size = idle_path.stat().st_size
+            l2._max_bytes = served_size
+            with l2._lock:
+                l2._tracked_disk_bytes = served_size + idle_size
+            l2._evict_to_budget()
+
+            assert served_path.exists()
+            assert not idle_path.exists()
+            assert l2.stats()["evictions"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_lookup_reject_does_not_refresh_mtime(self, tmp_path):
+        import os
+
+        key = _make_key()
+        trimmed = _make_trimmed_snapshot(list(range(100)), key)
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            _insert_l2_sync(l2, trimmed)
+            path = l2._final_path_for(trimmed)
+            os.utime(path, ns=(10**9, 10**9))
+
+            miss = l2.lookup(
+                tuple(range(100)), key, require_full_coverage=True
+            )
+            assert miss is None
+            assert l2.stats()["coverage_rejects"] == 1
+            assert path.stat().st_mtime_ns == 10**9
+        finally:
+            l2.shutdown()
+
+
+def test_sink_zero_snapshot_has_only_nonempty_target_hidden_chunks():
+    from dflash_mlx.cache.codecs import build_snapshot
+
+    key = _make_key()
+    n = 128
+    snap = build_snapshot(
+        token_ids=list(range(n)),
+        target_cache=[
+            _make_kv_cache_populated(n_tokens=n),
+            _make_gdn_cache_populated(),
+        ],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="prefill",
+        draft_sink_size=0,
+        draft_window_size=16,
+    )
+
+    assert snap.target_hidden_chunk_spans == ((n - 16, n),)
+    arrays, meta_dict = _serialize(snap)
+    meta = json.loads(meta_dict["dflash_meta"])
+    restored = _deserialize(arrays, meta)
+
+    assert meta["target_hidden_chunk_spans"] == [[n - 16, n]]
+    assert arrays["target_hidden_0"].size > 0
+    assert restored.target_hidden_chunk_spans == snap.target_hidden_chunk_spans
+    assert restored.target_hidden_chunks[0].size > 0

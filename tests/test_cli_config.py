@@ -38,6 +38,7 @@ _RUNTIME_ENV_KEYS = (
     "DFLASH_VERIFY_MODE",
     "DFLASH_VERIFY_LINEAR",
     "DFLASH_VERIFY_QMM",
+    "DFLASH_QUANTIZE_KV_CACHE",
 )
 
 def _clear_runtime_env(monkeypatch):
@@ -691,6 +692,10 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
         (["--model", "m", "--prefill-step-size", "0"], "--prefill-step-size"),
         (["--model", "m", "--draft-sink-size", "-1"], "draft_sink_size"),
         (["--model", "m", "--draft-window-size", "0"], "draft_window_size"),
+        (
+            ["--model", "m", "--draft-full-context-min-ctx", "-1"],
+            "draft_full_context_min_ctx",
+        ),
         (["--model", "m", "--verify-len-cap", "-1"], "verify_len_cap"),
         (["--model", "m", "--fastpath-max-tokens", "-1"], "--fastpath-max-tokens"),
     ],
@@ -708,6 +713,7 @@ def test_serve_default_sets_product_runtime(monkeypatch):
     assert cfg.prefill_step_size == 2048
     assert cfg.draft_sink_size == 64
     assert cfg.draft_window_size == 1024
+    assert cfg.draft_full_context_min_ctx == 16384
     assert cfg.verify_len_cap == 0
     assert cfg.prefix_cache is True
     assert cfg.prefix_cache_max_entries == 8
@@ -783,3 +789,54 @@ def test_prefix_cache_disabled_disables_l2(monkeypatch):
     normalize_cli_args(args)
     assert args.runtime_config.prefix_cache is False
     assert args.runtime_config.prefix_cache_l2 is False
+
+
+def test_serve_cli_quantize_kv_cache_default_off(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+
+    args = build_parser().parse_args(["--model", "m"])
+    normalize_cli_args(args)
+
+    assert args.runtime_config.quantize_kv_cache is False
+
+
+def test_serve_cli_quantize_kv_cache_flag(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+
+    args = build_parser().parse_args(["--model", "m", "--quantize-kv-cache"])
+    normalize_cli_args(args)
+
+    assert args.runtime_config.quantize_kv_cache is True
+
+
+def test_serve_cli_quantize_kv_cache_env(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("DFLASH_QUANTIZE_KV_CACHE", "1")
+
+    args = build_parser().parse_args(["--model", "m"])
+    normalize_cli_args(args)
+
+    assert args.runtime_config.quantize_kv_cache is True
+
+
+def test_quantize_kv_cache_rejects_target_fa_window():
+    from dataclasses import replace
+
+    from dflash_mlx.runtime.config import (
+        DEFAULT_RUNTIME_CONFIG,
+        validate_runtime_config,
+    )
+
+    cfg = replace(DEFAULT_RUNTIME_CONFIG, quantize_kv_cache=True, target_fa_window=4096)
+    with pytest.raises(ValueError, match="target_fa_window"):
+        validate_runtime_config(cfg)
+
+
+def test_offline_surfaces_include_quantize_kv_cache():
+    from dflash_mlx.runtime.config import (
+        BENCHMARK_RUNTIME_FIELDS,
+        GENERATE_RUNTIME_FIELDS,
+    )
+
+    assert "quantize_kv_cache" in GENERATE_RUNTIME_FIELDS
+    assert "quantize_kv_cache" in BENCHMARK_RUNTIME_FIELDS

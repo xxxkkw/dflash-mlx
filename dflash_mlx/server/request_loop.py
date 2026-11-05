@@ -118,6 +118,13 @@ def consume_dflash_events(
                 fields=memory_start,
             )
 
+    # Use the manager resolved for THIS request rather than the process-wide
+    # "current" one: with several models registered, the global current can
+    # point at a different model when requests interleave. prefix_flow carries
+    # the right model's manager (or None when the cache is off for it).
+    cache_manager = prefix_flow.cache_manager if prefix_flow is not None else None
+    if cache_manager is not None:
+        cache_manager.begin_request()
     try:
         for event in event_iter:
             if isinstance(event, CycleCompleteEvent):
@@ -318,6 +325,8 @@ def consume_dflash_events(
         close = getattr(event_iter, "close", None)
         if close is not None:
             close()
+        if cache_manager is not None:
+            cache_manager.end_request()
         if memory_boundary_enabled:
             memory_event = (
                 collect_memory_waterfall(

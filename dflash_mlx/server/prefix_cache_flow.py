@@ -14,11 +14,14 @@ from dflash_mlx.cache.manager import (
     RuntimeCacheManager,
     get_runtime_cache_manager,
 )
+from dflash_mlx.cache.codecs import requires_full_target_hidden
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.snapshot_service import SnapshotService
+from dflash_mlx.engine.spec_epoch import resolve_full_context_draft_layers
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key,
+    build_runtime_cache_identity,
     chat_template_stable_marker,
 )
 
@@ -108,15 +111,10 @@ def _lookup_stats(
     stable_prefix_len: int,
     lookup_ms: float,
     hit_tokens: int,
+    hit_kind: str,
     snapshot: Optional[DFlashPrefixSnapshot],
 ) -> PrefixCacheLookupStats:
     lookup_tokens = min(len(prompt), stable_prefix_len)
-    if hit_tokens <= 0:
-        hit_kind = "miss"
-    elif hit_tokens == lookup_tokens:
-        hit_kind = "exact"
-    else:
-        hit_kind = "prefix"
     return PrefixCacheLookupStats(
         prompt_tokens=len(prompt),
         stable_prefix_tokens=stable_prefix_len,
@@ -141,6 +139,7 @@ class PrefixCacheFlow:
     lookup_ms: float = 0.0
     hit_tokens: int = 0
     lookup_stats: PrefixCacheLookupStats = field(default_factory=PrefixCacheLookupStats)
+    hit_kind: str = "miss"
     snapshot_service: Optional[SnapshotService] = None
 
     @property
@@ -171,6 +170,7 @@ class PrefixCacheFlow:
         prompt: list[int],
         request: Any = None,
         request_id: int | None = None,
+        max_new_tokens: int = 0,
         runtime_context: Optional[Any] = None,
     ) -> "PrefixCacheFlow":
         if runtime_context is None:
@@ -178,7 +178,10 @@ class PrefixCacheFlow:
 
         runtime_config = runtime_context.runtime
         if runtime_config.target_fa_window > 0 or not runtime_config.prefix_cache:
-            get_runtime_cache_manager(runtime_context)
+            get_runtime_cache_manager(
+                runtime_context,
+                cache_identity=build_runtime_cache_identity(model_provider),
+            )
             return cls(cache_manager=None)
 
         key = build_prefix_key(model_provider, draft_model, runtime_context)
@@ -192,15 +195,27 @@ class PrefixCacheFlow:
             request=request,
         )
         lookup_tokens = prompt[:stable_prefix_len]
-        try:
-            if request_id is None:
-                lookup = cache_manager.lookup(lookup_tokens, key)
-            else:
-                lookup = cache_manager.lookup(
-                    lookup_tokens,
-                    key,
-                    request_id=request_id,
+        require_full_coverage = requires_full_target_hidden(
+            draft_model,
+            allow_full_attention_context=True,
+        ) and resolve_full_context_draft_layers(
+            supports=bool(
+                getattr(
+                    model_provider.target_ops.capabilities_for(model_provider.model),
+                    "supports_full_context_draft_layers",
+                    False,
                 )
+            ),
+            projected_ctx=len(prompt) + max(0, int(max_new_tokens)),
+            min_ctx=int(runtime_config.draft_full_context_min_ctx),
+        )
+        lookup_kwargs: dict[str, Any] = {}
+        if request_id is not None:
+            lookup_kwargs["request_id"] = request_id
+        if require_full_coverage:
+            lookup_kwargs["require_full_coverage"] = True
+        try:
+            lookup = cache_manager.lookup(lookup_tokens, key, **lookup_kwargs)
         except RuntimeCacheManagerClosed:
             return cls(cache_manager=None)
         hit_tokens = int(lookup.matched_tokens)
@@ -209,12 +224,14 @@ class PrefixCacheFlow:
             stable_prefix_len=stable_prefix_len,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
+            hit_kind=lookup.hit_kind,
             snapshot=lookup.snapshot,
         )
         if lookup.matched_tokens > 0:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache hit "
-                f"{hit_tokens}/{len(prompt)} tokens (stable prefix {stable_prefix_len})\n"
+                f"{hit_tokens}/{len(prompt)} tokens "
+                f"({lookup.hit_kind}, stable prefix {stable_prefix_len})\n"
             )
             sys.stderr.flush()
         try:
@@ -230,6 +247,7 @@ class PrefixCacheFlow:
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
             lookup_stats=lookup_stats,
+            hit_kind=lookup.hit_kind,
             snapshot_service=(
                 SnapshotService.from_request(
                     cache_manager=cache_manager,

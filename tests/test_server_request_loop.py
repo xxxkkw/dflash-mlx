@@ -288,7 +288,8 @@ def test_consume_dflash_events_ignores_snapshot_publication_metadata():
         lookup_ms=0.1,
         hit_tokens=2,
         insert_ms=0.5,
-        lookup_stats={"hit_kind": "exact", "snapshot_tokens": 3},
+        lookup_stats={"hit_kind": "l1_exact", "snapshot_tokens": 3},
+        cache_manager=None,
     )
     rqueue = SimpleQueue()
     events = ClosableEvents(
@@ -338,7 +339,7 @@ def test_consume_dflash_events_ignores_snapshot_publication_metadata():
     assert result.cache_lookup_ms == 0.1
     assert result.cache_hit_tokens == 2
     assert result.cache_insert_ms == 0.5
-    assert result.cache_lookup_stats == {"hit_kind": "exact", "snapshot_tokens": 3}
+    assert result.cache_lookup_stats == {"hit_kind": "l1_exact", "snapshot_tokens": 3}
 
 
 def test_consume_dflash_events_rejects_stale_dict_events():
@@ -366,7 +367,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     captured = {}
     runtime_context = SimpleNamespace(
-        runtime=SimpleNamespace(),
+        runtime=SimpleNamespace(quantize_kv_cache=False),
         diagnostics=SimpleNamespace(
             trace=SimpleNamespace(log_dir=None),
             memory_waterfall=False,
@@ -380,13 +381,16 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
         target_ops=object(),
         cli_args=SimpleNamespace(runtime_context=runtime_context),
     )
+    flow_snapshot = object()
     prefix_flow = SimpleNamespace(
         hit_tokens=4,
+        hit_kind="l1_exact",
         lookup_ms=0.25,
-        snapshot=object(),
+        snapshot=flow_snapshot,
         snapshot_service=object(),
         stable_prefix_len=3,
         cache_active=True,
+        cache_manager=None,
         publish_generation_snapshot=True,
         insert_ms=0.0,
         prefix_cache_memory_bytes=lambda: None,
@@ -478,10 +482,13 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
     )
 
     assert captured["publish_generation_snapshot"] is True
-    assert captured["prefix_snapshot"] is prefix_flow.snapshot
+    assert captured["prefix_snapshot"] is flow_snapshot
+    # The server drops its snapshot ref once the engine owns it.
+    assert prefix_flow.snapshot is None
     assert captured["snapshot_service"] is prefix_flow.snapshot_service
     assert captured["stable_prefix_len"] == 3
     assert captured["prefix_cache_active"] is True
+    assert captured["prefix_hit_kind"] == "l1_exact"
 
 
 def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
@@ -489,6 +496,7 @@ def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
         lookup_ms = 0.0
         hit_tokens = 0
         insert_ms = 0.0
+        cache_manager = None
 
         def prefix_cache_memory_bytes(self):
             return {

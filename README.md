@@ -28,9 +28,10 @@ https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
 
 - **Tape-replay rollback** — instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
 - **Target-owned long-context attention routing** — Qwen and Gemma adapters route verify blocks through the appropriate MLX or GQA-reshape SDPA path internally, keeping the public CLI free of attention-kernel switches.
-- **Verify-specialized int4 qmm** (`verify_qmm`) — custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers.
+- **Verify-specialized int4 qmm** (`verify_qmm`) — custom Metal kernels for the small-M quantized matmuls that dominate the target verify step. M5-class Apple GPUs (`applegpu_g17*`) use the Metal 4 NAX M=16 path automatically when the shape is supported; older Apple GPUs keep the steel simdgroup-MMA fallbacks. Auto-enabled on MoE targets and dense models with ≥40 layers.
 - **Numerical coherence** — bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
 - **Prefix cache (L1+L2)** — RAM snapshots of target KV + GDN recurrent state + captured hidden + last logits, with optional SSD spill, byte/entry budgets, and automatic eviction. Hits skip prefill on revisited prompts. This hot/cold cache hierarchy is inspired by [oMLX](https://github.com/jundot/omlx)'s tiered KV cache work, but dflash-mlx stores DFlash prefix snapshots rather than active paged-KV blocks.
+- **Positional sparse prefill** (`prompt_token_positions`) — `stream_dflash_generate` accepts an optional list of original positions alongside a compacted `prompt_tokens_override`, so a caller (e.g. oMLX specprefill) can prefill the target on a selected token subset placed at its true positions. Full-attention layers RoPE each token at its original position (contiguous runs delegate to the native rope and stay bitwise-exact); GDN layers run over the compacted sequence; gemma4 sliding-window layers rebuild their window mask from the true positions. Mutually exclusive with the prefix cache. Use chunk-based selection — incoherent (e.g. every-other-token) selection shreds local structure and collapses draft acceptance.
 
 ## Benchmarks
 
@@ -132,7 +133,7 @@ inside model tool spans; malformed or undeclared tool calls fail at the server
 boundary instead of leaking raw XML/JSON as assistant content. Chat Completions
 accepts `tool_choice: "auto"` and `tool_choice: "none"`; function-specific
 `tool_choice` and `parallel_tool_calls: false` are rejected because the server
-does not implement serial tool enforcement. DFlash handles every request by
+does not implement serial tool enforcement. Greedy requests use DFlash by
 default; pass a positive `--fastpath-max-tokens` value to opt into the
 target-only short-response fast path.
 
@@ -140,7 +141,7 @@ target-only short-response fast path.
 adapter for text input and function-call tools. Streaming Responses,
 multimodal input, reasoning/text/truncation controls, `tool_choice`,
 `parallel_tool_calls`, and persistent `previous_response_id` / `store`
-behavior are not implemented.
+behavior are not implemented. Sampling and logprobs use exact target-only AR.
 
 Inspect live server metrics:
 
@@ -207,6 +208,7 @@ override that policy.
 | [mlx-community/Qwen3.5-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) |
 | [mlx-community/Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit) | [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) |
 | [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
+| [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) | [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) |
 | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
 | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
 | [mlx-community/gemma-4-31b-it-4bit](https://huggingface.co/mlx-community/gemma-4-31b-it-4bit) | [z-lab/gemma-4-31B-it-DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) |

@@ -59,6 +59,7 @@ class EffectiveRuntimeConfig:
     prefill_step_size: int
     draft_sink_size: int
     draft_window_size: int
+    draft_full_context_min_ctx: int
     verify_len_cap: int
     prefix_cache: bool
     prefix_cache_max_entries: int
@@ -71,11 +72,15 @@ class EffectiveRuntimeConfig:
     target_fa_window: int
     dflash_max_ctx: int
     verify_mode: str
+    copyspec_mode: str
+    quantize_kv_cache: bool
+    prefix_cache_l2_frontier_stride: int
 
 DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     prefill_step_size=2048,
     draft_sink_size=64,
     draft_window_size=1024,
+    draft_full_context_min_ctx=16384,
     verify_len_cap=0,
     prefix_cache=True,
     prefix_cache_max_entries=8,
@@ -88,6 +93,9 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     target_fa_window=0,
     dflash_max_ctx=0,
     verify_mode="adaptive",
+    copyspec_mode="conservative",
+    quantize_kv_cache=False,
+    prefix_cache_l2_frontier_stride=0,
 )
 
 @dataclass(frozen=True)
@@ -183,6 +191,21 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
+        field="draft_full_context_min_ctx",
+        flags=("--draft-full-context-min-ctx",),
+        env="DFLASH_DRAFT_FULL_CONTEXT_MIN_CTX",
+        value_type=int,
+        help=(
+            "Projected context (prompt + max new tokens) at or above which the "
+            "draft full-attention layer attends all context features instead of "
+            "the sink+window slice. 0 = always full-context. Short contexts pay "
+            "a measured pure cost with no acceptance gain; deep contexts gain "
+            "from matching the draft's full-attention training condition."
+        ),
+        metavar="INT",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
         field="verify_len_cap",
         flags=("--verify-len-cap",),
         env="DFLASH_VERIFY_LEN_CAP",
@@ -204,6 +227,19 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         env="DFLASH_VERIFY_MODE",
         choices=("dflash", "adaptive", "ddtree", "off"),
         help="Verify path mode. Default adaptive shortens low-acceptance blocks; use off only for debug/parity.",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
+        field="copyspec_mode",
+        flags=("--copyspec-mode",),
+        env="DFLASH_COPYSPEC_MODE",
+        choices=("conservative", "off", "auto"),
+        help=(
+            "Prompt-lookup (copyspec) drafting. Default 'conservative' disables copyspec after one missed "
+            "copy block. 'auto' self-gates: periodically A/B-probes copyspec on vs off and latches to whichever "
+            "is faster, resetting adaptive state on disengage (a clear win on strong-copyspec targets like large "
+            "MoE; self-disables where copyspec doesn't pay off). 'off' disables copyspec entirely."
+        ),
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
@@ -239,6 +275,18 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
             "Accepts raw bytes or suffixes like 50GB."
         ),
         metavar="BYTES",
+    ),
+    RuntimeConfigFieldSpec(
+        field="prefix_cache_l2_frontier_stride",
+        flags=("--prefix-cache-l2-frontier-stride",),
+        env="DFLASH_PREFIX_CACHE_L2_FRONTIER_STRIDE",
+        value_type=int,
+        help=(
+            "Token stride at which L2 frontier snapshots are written during cold "
+            "prefill. 0 = auto (default: 8192, rounded up to a prefill-step "
+            "multiple). Values below 8192 are raised to the disk-pressure floor."
+        ),
+        metavar="INT",
     ),
     RuntimeConfigFieldSpec(
         field="prefix_cache",
@@ -280,6 +328,22 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
             "N>0 uses a rotating KV cache of N tokens for target full-attention layers only."
         ),
         metavar="INT",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
+        field="quantize_kv_cache",
+        flags=("--quantize-kv-cache",),
+        env="DFLASH_QUANTIZE_KV_CACHE",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Quantize the target full-attention KV cache to 8-bit "
+            "(group size 64). Halves KV memory growth at long context; "
+            "linear (gated-delta) layer state is unaffected. Trade-off: "
+            "decode slows as context grows (no fused quantized-KV "
+            "attention kernel in MLX yet) — use when memory is the "
+            "binding constraint. Default: disabled. Incompatible with "
+            "--target-fa-window."
+        ),
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
@@ -351,19 +415,25 @@ def runtime_config_field_defaults(
 
 _GENERATE_RUNTIME_FIELD_ORDER = (
     "verify_mode",
+    "copyspec_mode",
     "prefill_step_size",
     "target_fa_window",
+    "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
+    "draft_full_context_min_ctx",
     "verify_len_cap",
 )
 
 _BENCHMARK_RUNTIME_FIELD_ORDER = (
     "verify_mode",
+    "copyspec_mode",
     "prefill_step_size",
     "target_fa_window",
+    "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
+    "draft_full_context_min_ctx",
     "verify_len_cap",
 )
 
@@ -382,6 +452,7 @@ def runtime_config_from_defaults(
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     prefix_cache: bool | None = None,
     prefix_cache_max_entries: int | None = None,
@@ -394,6 +465,9 @@ def runtime_config_from_defaults(
     target_fa_window: int = 0,
     dflash_max_ctx: int = 0,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
+    quantize_kv_cache: bool | None = None,
+    prefix_cache_l2_frontier_stride: int | None = None,
 ) -> EffectiveRuntimeConfig:
     defaults = DEFAULT_RUNTIME_CONFIG
     return validate_runtime_config(
@@ -412,6 +486,11 @@ def runtime_config_from_defaults(
                 defaults.draft_window_size
                 if draft_window_size is None
                 else int(draft_window_size)
+            ),
+            draft_full_context_min_ctx=(
+                defaults.draft_full_context_min_ctx
+                if draft_full_context_min_ctx is None
+                else int(draft_full_context_min_ctx)
             ),
             verify_len_cap=(
                 defaults.verify_len_cap
@@ -455,6 +534,17 @@ def runtime_config_from_defaults(
             target_fa_window=int(target_fa_window),
             dflash_max_ctx=int(dflash_max_ctx),
             verify_mode=defaults.verify_mode if verify_mode is None else str(verify_mode),
+            copyspec_mode=defaults.copyspec_mode if copyspec_mode is None else str(copyspec_mode),
+            quantize_kv_cache=(
+                defaults.quantize_kv_cache
+                if quantize_kv_cache is None
+                else bool(quantize_kv_cache)
+            ),
+            prefix_cache_l2_frontier_stride=(
+                defaults.prefix_cache_l2_frontier_stride
+                if prefix_cache_l2_frontier_stride is None
+                else int(prefix_cache_l2_frontier_stride)
+            ),
         )
     )
 
@@ -476,10 +566,20 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             _runtime_env("draft_window_size"),
             defaults.draft_window_size,
         ),
+        draft_full_context_min_ctx=_resolve_int(
+            getattr(args, "draft_full_context_min_ctx", None),
+            _runtime_env("draft_full_context_min_ctx"),
+            defaults.draft_full_context_min_ctx,
+        ),
         verify_len_cap=_resolve_int(
             getattr(args, "verify_len_cap", None),
             _runtime_env("verify_len_cap"),
             defaults.verify_len_cap,
+        ),
+        quantize_kv_cache=_resolve_bool(
+            getattr(args, "quantize_kv_cache", None),
+            _runtime_env("quantize_kv_cache"),
+            defaults.quantize_kv_cache,
         ),
         prefix_cache=_resolve_bool(
             getattr(args, "prefix_cache", None),
@@ -532,6 +632,12 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             0,
         ),
         verify_mode=_resolve_verify_mode(getattr(args, "verify_mode", None), defaults.verify_mode),
+        copyspec_mode=_resolve_copyspec_mode(getattr(args, "copyspec_mode", None), defaults.copyspec_mode),
+        prefix_cache_l2_frontier_stride=_resolve_int(
+            getattr(args, "prefix_cache_l2_frontier_stride", None),
+            _runtime_env("prefix_cache_l2_frontier_stride"),
+            defaults.prefix_cache_l2_frontier_stride,
+        ),
     )
 
 def runtime_config_sources(args: Any, cfg: EffectiveRuntimeConfig) -> dict[str, str]:
@@ -547,8 +653,18 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--draft-sink-size / draft_sink_size must be >= 0")
     if cfg.draft_window_size <= 0:
         raise ValueError("--draft-window-size / draft_window_size must be > 0")
+    if cfg.draft_full_context_min_ctx < 0:
+        raise ValueError(
+            "--draft-full-context-min-ctx / draft_full_context_min_ctx must be >= 0"
+        )
     if cfg.verify_len_cap < 0:
         raise ValueError("--verify-len-cap / verify_len_cap must be >= 0")
+    if cfg.quantize_kv_cache and cfg.target_fa_window > 0:
+        raise ValueError(
+            "--quantize-kv-cache / quantize_kv_cache cannot be combined with "
+            "--target-fa-window / target_fa_window (rotating window caches "
+            "do not support quantized KV)"
+        )
     if cfg.prefix_cache_max_entries <= 0:
         raise ValueError(
             "--prefix-cache-max-entries / prefix_cache_max_entries must be > 0"
@@ -571,9 +687,18 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--target-fa-window / target_fa_window must be >= 0")
     if cfg.dflash_max_ctx < 0:
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
+    if cfg.prefix_cache_l2_frontier_stride < 0:
+        raise ValueError(
+            "--prefix-cache-l2-frontier-stride / "
+            "prefix_cache_l2_frontier_stride must be >= 0"
+        )
     if cfg.verify_mode not in ("dflash", "adaptive", "ddtree", "off"):
         raise ValueError(
             "--verify-mode / verify_mode must be dflash, adaptive, ddtree, or off"
+        )
+    if cfg.copyspec_mode not in ("conservative", "off", "auto"):
+        raise ValueError(
+            "--copyspec-mode / copyspec_mode must be conservative, off, or auto"
         )
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
@@ -635,6 +760,14 @@ def _resolve_verify_mode(cli_value: str | None, default: str) -> str:
     if cli_value is not None:
         return str(cli_value)
     raw = os.environ.get(_runtime_env("verify_mode"), "").strip()
+    if raw:
+        return raw
+    return default
+
+def _resolve_copyspec_mode(cli_value: str | None, default: str) -> str:
+    if cli_value is not None:
+        return str(cli_value)
+    raw = os.environ.get(_runtime_env("copyspec_mode"), "").strip()
     if raw:
         return raw
     return default

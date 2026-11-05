@@ -63,10 +63,62 @@ from dflash_mlx.server.tool_calls import (
 def _read_project_version() -> str:
     return _DFLASH_VERSION
 
+
+def _target_only_api_reason(args: object) -> str | None:
+    sampling = getattr(args, "sampling", None)
+    temperature = float(getattr(sampling, "temperature", 0.0) or 0.0)
+    if temperature > 0.0:
+        return f"temperature={temperature:g}"
+    if float(getattr(sampling, "xtc_probability", 0.0) or 0.0) > 0.0:
+        return "xtc_probability"
+
+    logits = getattr(args, "logits", None)
+    if getattr(logits, "logit_bias", None):
+        return "logit_bias"
+    for field in ("repetition_penalty", "presence_penalty", "frequency_penalty"):
+        if float(getattr(logits, field, 0.0) or 0.0) != 0.0:
+            return field
+
+    if bool(getattr(args, "logprobs", False)):
+        return "logprobs"
+    top_logprobs = getattr(args, "top_logprobs", -1)
+    if top_logprobs is not None and int(top_logprobs) >= 0:
+        return "top_logprobs"
+    return None
+
+
 class DFlashResponseGenerator(mlx_server.ResponseGenerator):
     def __init__(self, model_provider, prompt_cache, server_runtime: ServerRuntime):
         super().__init__(model_provider, prompt_cache)
         self.server_runtime = server_runtime
+        self.last_finish_reason = None
+        self.last_prompt_token_count = None
+        self.last_completion_token_count = None
+
+    def generate(self, request, generation_args, progress_callback=None):
+        self.last_finish_reason = None
+        self.last_prompt_token_count = None
+        self.last_completion_token_count = None
+        ctx, response = super().generate(
+            request,
+            generation_args,
+            progress_callback=progress_callback,
+        )
+
+        def _track(inner):
+            for gen in inner:
+                reason = getattr(gen, "finish_reason", None)
+                if reason is not None:
+                    self.last_finish_reason = reason
+                prompt_tokens = getattr(gen, "prompt_tokens", None)
+                if prompt_tokens is not None:
+                    self.last_prompt_token_count = int(prompt_tokens)
+                generation_tokens = getattr(gen, "generation_tokens", None)
+                if generation_tokens is not None:
+                    self.last_completion_token_count = int(generation_tokens)
+                yield gen
+
+        return ctx, _track(response)
 
     def _restore_thinking_enabled(self, had_previous: bool, previous: object) -> None:
         if had_previous:
@@ -159,11 +211,24 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             fastpath_max_tokens = int(
                 getattr(self.model_provider.cli_args, "fastpath_max_tokens", 0) or 0
             )
+            target_only_reason = _target_only_api_reason(args)
+            use_fastpath = (
+                fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens
+            )
 
-            if fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens:
+            if target_only_reason is not None or use_fastpath:
+                mode_used = (
+                    "ar_sampling" if target_only_reason is not None else "ar_fastpath"
+                )
+                if target_only_reason is not None:
+                    message = f"exact target AR | {target_only_reason}"
+                else:
+                    message = (
+                        f"fast-path AR | max_tokens={args.max_tokens} "
+                        f"threshold={fastpath_max_tokens}"
+                    )
                 sys.stderr.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | "
-                    f"max_tokens={args.max_tokens} threshold={fastpath_max_tokens}\n"
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {message}\n"
                 )
                 sys.stderr.flush()
                 saved_draft_model = self.model_provider.draft_model
@@ -171,7 +236,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 completed = False
                 self.server_runtime.start_target_only_request(
                     request_id=request_id,
-                    mode_used="ar_fastpath",
+                    mode_used=mode_used,
                     max_tokens=int(args.max_tokens),
                 )
                 try:
@@ -185,7 +250,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                         wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
                         self.server_runtime.record_target_only_request(
                             request_id=request_id,
-                            mode_used="ar_fastpath",
+                            mode_used=mode_used,
                             wall_ms=wall_ms,
                             max_tokens=int(args.max_tokens),
                         )
@@ -363,6 +428,16 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             },
         )
 
+    def _set_stream_headers(self, status_code: int = 200):
+        super()._set_stream_headers(status_code)
+        if status_code == 200:
+            self._completion_response_started = True
+
+    def _set_completion_headers(self, status_code: int = 200):
+        super()._set_completion_headers(status_code)
+        if status_code == 200:
+            self._completion_response_started = True
+
     def handle_completion(self, request, stop_words):
         try:
             apply_tool_choice(request, getattr(self, "tool_choice", None))
@@ -372,6 +447,7 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             logging.warning("Rejected tool-call request: %s", e)
             self._write_completion_error_response(400, str(e))
             return
+        self._completion_response_started = False
         try:
             return super().handle_completion(request, stop_words)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -379,8 +455,45 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             return
         except ToolCallParseError as e:
             logging.error("Tool parser error: %s", e)
-            self._write_completion_error_response(400, str(e))
+            if getattr(self, "_completion_response_started", False):
+                # Headers (and possibly stream chunks) are already on the
+                # wire; a late 400 would just drop the stream without a
+                # finish_reason. Close the response cleanly instead.
+                self._finalize_completion_after_tool_parse_error()
+            else:
+                self._write_completion_error_response(400, str(e))
             return
+
+    def _finalize_completion_after_tool_parse_error(self) -> None:
+        finish_reason = (
+            getattr(self.response_generator, "last_finish_reason", None) or "length"
+        )
+        logging.error(
+            "Closing in-flight completion with finish_reason=%s after tool parse "
+            "failure (tool call likely truncated by max_tokens)",
+            finish_reason,
+        )
+        response = self.generate_response(
+            "",
+            finish_reason,
+            prompt_token_count=int(
+                getattr(self.response_generator, "last_prompt_token_count", None) or 0
+            ),
+            completion_token_count=int(
+                getattr(self.response_generator, "last_completion_token_count", None)
+                or 0
+            ),
+        )
+        payload = json.dumps(response)
+        try:
+            if self.stream:
+                self.wfile.write(f"data: {payload}\n\n".encode())
+                self.wfile.write("data: [DONE]\n\n".encode())
+            else:
+                self.wfile.write(payload.encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def generate_response(self, *args, **kwargs):
         response = super().generate_response(*args, **kwargs)

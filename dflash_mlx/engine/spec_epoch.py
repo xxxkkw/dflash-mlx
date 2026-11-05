@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections import deque
@@ -13,15 +14,21 @@ from typing import Any, Literal, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.codecs import hydrate_target_cache
+from dflash_mlx.cache.codecs import (
+    capture_gdn_sidecar,
+    hydrate_target_cache,
+    requires_full_target_hidden,
+    sidecar_eligible,
+)
 from dflash_mlx.cache.snapshot_service import SnapshotPublication, SnapshotService
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
+    TargetHiddenChunks,
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
-from dflash_mlx.engine.copyspec import CopySpecIndex
+from dflash_mlx.engine.copyspec import CopySpecAutoGate, CopySpecIndex
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
     build_flat_tree_inputs,
@@ -36,17 +43,27 @@ from dflash_mlx.engine.ddtree import (
     verify_candidates_batch as ddtree_verify_candidates_batch,
 )
 from dflash_mlx.engine.fallback import stream_baseline_generate
-from dflash_mlx.engine.prefill import compute_snapshot_boundary
+from dflash_mlx.engine.prefill import compute_snapshot_boundary, snapshot_covers_prefix
+from dflash_mlx.engine.sparse_rope import (
+    clear_sparse_positions,
+    decode_position_adjustment,
+    install_position_mapped_rope,
+    restore_ropes,
+    set_sparse_positions,
+    switch_to_offset_adjusted_rope,
+)
 from dflash_mlx.engine.sampling import (
     build_suppress_token_mask,
     eval_logits_and_captured,
     greedy_tokens_with_mask,
+    masked_topk_arrays,
     ns_to_us,
     prepare_prompt_tokens,
 )
 from dflash_mlx.engine.target_features import TargetFeatureStore
 from dflash_mlx.engine.config import (
     _profile_dflash_cycles_enabled,
+    draft_capability,
     resolve_draft_window,
     resolve_speculative_cycle_config,
     verify_token_count_for_block,
@@ -69,6 +86,7 @@ from dflash_mlx.engine.memory_waterfall import (
 )
 
 _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
+_SIDECAR_MIN_BOUNDARY = 4096
 _DDTREE_TOP_WIDTH = 2
 _DDTREE_MAX_BRANCH_POSITIONS = 2
 _ADAPTIVE_REDUCED_BURST_CYCLES = 64
@@ -84,6 +102,24 @@ _ADAPTIVE_TPC_THRESHOLD = 3.5
 _ADAPTIVE_RESUME_SPEED_RATIO = 1.0
 
 
+def resolve_full_context_draft_layers(
+    *,
+    supports: bool,
+    projected_ctx: int,
+    min_ctx: int,
+) -> bool:
+    """Full-context draft layers engage above a projected-context threshold.
+
+    Below it the windowed draft sees the same effective conditioning while
+    skipping the full-attention pass over all context features (a measured
+    pure cost at short context, a large acceptance win at depth).
+    """
+    if not supports:
+        return False
+    if min_ctx <= 0:
+        return True
+    return int(projected_ctx) >= int(min_ctx)
+
 @dataclass(frozen=True)
 class _SessionRequest:
     prompt_tokens: tuple[int, ...]
@@ -96,6 +132,12 @@ class _SessionRequest:
     stable_prefix_len: Optional[int] = None
     prefix_cache_active: bool = False
     publish_generation_snapshot: bool = True
+    prefix_hit_kind: str = "miss"
+    # Original positions of the prompt tokens for positional sparse prefill. When
+    # None (default), prefill is dense and tokens occupy contiguous positions
+    # 0..prompt_len-1. When provided, prompt_tokens are a selected subset and each
+    # is RoPE'd at its original position.
+    prompt_token_positions: Optional[tuple[int, ...]] = None
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)
     stop_token_array: Optional[mx.array] = field(init=False, repr=False)
@@ -114,6 +156,8 @@ class _SessionRequest:
         stable_prefix_len: Optional[int],
         prefix_cache_active: bool,
         publish_generation_snapshot: bool = True,
+        prefix_hit_kind: str = "miss",
+        prompt_token_positions: Optional[list[int]] = None,
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -130,10 +174,17 @@ class _SessionRequest:
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=bool(prefix_cache_active),
             publish_generation_snapshot=bool(publish_generation_snapshot),
+            prefix_hit_kind=str(prefix_hit_kind),
+            prompt_token_positions=(
+                tuple(int(pos) for pos in prompt_token_positions)
+                if prompt_token_positions is not None
+                else None
+            ),
         )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt_len", len(self.prompt_tokens))
+        self._validate_token_positions()
         object.__setattr__(
             self,
             "prompt_array",
@@ -146,10 +197,45 @@ class _SessionRequest:
         )
         object.__setattr__(self, "stop_token_array", stop_array)
 
+    def _validate_token_positions(self) -> None:
+        positions = self.prompt_token_positions
+        if positions is None:
+            return
+        if self.prefix_snapshot is not None:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with a prefix "
+                "snapshot; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
+        if self.prefix_cache_active:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with an active prefix "
+                "cache; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
+        if len(positions) != self.prompt_len:
+            raise ValueError(
+                "prompt_token_positions and prompt_tokens must have the same "
+                f"length (got {len(positions)} positions for {self.prompt_len} "
+                "tokens)"
+            )
+        if positions and positions[0] < 0:
+            raise ValueError("prompt_token_positions must be non-negative")
+        for prev, cur in zip(positions, positions[1:]):
+            if cur <= prev:
+                raise ValueError(
+                    "prompt_token_positions must be strictly increasing "
+                    f"(got {prev} followed by {cur})"
+                )
+
     def should_collect_generation_snapshot_hidden(
         self,
         supports_prefix_snapshot: bool,
     ) -> bool:
+        if self.prompt_token_positions is not None:
+            # Sparse prefill stores KV at non-contiguous positions; a snapshot
+            # keyed on a dense token prefix would be unusable.
+            return False
         if not supports_prefix_snapshot or not self.publish_generation_snapshot:
             return False
         if self.snapshot_service is None or not self.snapshot_service.active:
@@ -514,6 +600,33 @@ class _AdaptiveBlockPolicy:
             self._enter_reduced()
 
 
+def _capture_rows_int(arr: mx.array) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(int(t) for t in row) for row in arr.tolist())
+
+
+def _capture_rows_float(arr: mx.array) -> tuple[tuple[float, ...], ...]:
+    return tuple(tuple(float(v) for v in row) for row in arr.tolist())
+
+
+def _draft_capability(
+    draft_model: Any,
+    capability: str,
+    *,
+    default: bool,
+) -> bool:
+    return bool(draft_capability(draft_model, capability, default))
+
+
+def _validate_draft_runtime_compatibility(
+    draft_model: Any,
+    runtime_config: Any,
+) -> None:
+    if str(getattr(runtime_config, "verify_mode", "dflash")) == "ddtree" and not (
+        _draft_capability(draft_model, "supports_ddtree", default=True)
+    ):
+        raise ValueError("draft model does not support --verify-mode ddtree")
+
+
 @dataclass
 class SpeculativeSession:
     target_model: Any
@@ -536,6 +649,8 @@ class SpeculativeSession:
     clear_cache_boundaries: bool
     target_fa_window: int
     copyspec_index: CopySpecIndex
+    copyspec_mode: str
+    capture_logits: bool = False
 
     @classmethod
     def open(
@@ -565,6 +680,16 @@ class SpeculativeSession:
         if not supports_prefix_snapshot:
             snap_prefix_len = 0
         if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
+            snap_prefix_len = 0
+        if (
+            snap_prefix_len > 0
+            and allow_full_context_draft_layers
+            and requires_full_target_hidden(
+                draft_model,
+                allow_full_attention_context=True,
+            )
+            and not snapshot_covers_prefix(prefix_snapshot, snap_prefix_len)
+        ):
             snap_prefix_len = 0
         if snap_prefix_len > 0:
             template_cache = target_ops.make_cache(
@@ -598,6 +723,10 @@ class SpeculativeSession:
         diagnostics = runtime_context.diagnostics
         profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
         memory_waterfall = _memory_waterfall_enabled(diagnostics)
+        capture_logits = os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
+        copyspec_mode = str(getattr(runtime_config, "copyspec_mode", "conservative"))
+        if not _draft_capability(draft_model, "supports_copyspec", default=True):
+            copyspec_mode = "off"
         return cls(
             target_model=target_model,
             draft_model=draft_model,
@@ -605,6 +734,7 @@ class SpeculativeSession:
             target_cache=target_cache,
             draft_cache=draft_cache,
             draft_backend=draft_backend,
+            capture_logits=capture_logits,
             runtime_config=runtime_config,
             quantize_kv_cache=bool(quantize_kv_cache),
             snap_prefix_len=snap_prefix_len,
@@ -621,6 +751,7 @@ class SpeculativeSession:
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
             copyspec_index=CopySpecIndex(prompt_tokens),
+            copyspec_mode=copyspec_mode,
         )
 
     def clear_cache_boundary(self) -> None:
@@ -691,6 +822,14 @@ class SpeculativeSession:
         publish_prefix_snapshots = bool(
             supports_prefix_snapshot and snapshot_service is not None
         )
+        if request.prompt_token_positions is not None:
+            # Sparse prefill RoPEs tokens at non-contiguous positions, so a
+            # prefix snapshot keyed on a dense token prefix cannot be replayed.
+            publish_prefix_snapshots = False
+        if request.max_new_tokens > 0 and request.should_collect_generation_snapshot_hidden(
+            supports_prefix_snapshot
+        ):
+            publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
         evt = self.memory_waterfall_event("after_target_cache_create")
@@ -867,6 +1006,9 @@ class SpeculativeSession:
             and prefix_snapshot.last_logits is None
         ):
             raise ValueError("prefill snapshot requires last_logits")
+        if prefix_snapshot is not None:
+            object.__setattr__(request, "prefix_snapshot", None)
+            prefix_snapshot = None
         if publish_prefix_snapshots and not exact_snapshot_restore:
             _snapshot_build = yield_pause.mark()
             snapshot_event = _publish_snapshot_event(
@@ -900,6 +1042,21 @@ class SpeculativeSession:
                 _pre_yield = yield_pause.mark()
                 yield evt
                 yield_pause.done(_pre_yield)
+
+        if (
+            snapshot_boundary >= _SIDECAR_MIN_BOUNDARY
+            and request.max_new_tokens > 0
+            and request.should_collect_generation_snapshot_hidden(
+                supports_prefix_snapshot
+            )
+            and state.prefill_logits is not None
+            and sidecar_eligible(target_cache)
+        ):
+            # Last point the boundary state exists; GDN cannot be rewound.
+            state.sidecar_boundary = int(snapshot_boundary)
+            state.sidecar_gdn_states = capture_gdn_sidecar(target_cache)
+            state.sidecar_last_logits = state.prefill_logits[:, -1, :]
+            mx.eval(state.sidecar_last_logits)
 
         if snapshot_boundary < prompt_len:
             if profile_cycles:
@@ -1028,6 +1185,10 @@ class SpeculativeSession:
             require_logits=False,
             snapshot_boundary=end_total_len,
             allow_full_context_draft_layers=self.allow_full_context_draft_layers,
+            adopt_cache_arrays=True,
+            sidecar_boundary=state.sidecar_boundary,
+            sidecar_gdn_states=state.sidecar_gdn_states,
+            sidecar_last_logits=state.sidecar_last_logits,
         )
         yield_pause.done(_snapshot_build)
         if snapshot_event is not None:
@@ -1089,7 +1250,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1597,7 +1758,9 @@ class SpeculativeSession:
             if best.source == "copyspec":
                 copyspec_hits_total += 1
                 copyspec_tokens_total += copyspec_tokens_cycle or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                # ddtree path has no adaptive policy / auto-gate: treat auto
+                # as the safe conservative one-strike here.
+                if self.copyspec_mode in ("conservative", "auto") and acceptance_len == 0:
                     state.copyspec_disabled = True
             if profile_cycles:
                 acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
@@ -1728,6 +1891,9 @@ class SpeculativeSession:
                     verify_token_count=int(verify_token_count),
                     draft_source=str(best.source),
                     candidate_count=len(candidate_ids_list),
+                    proposed_ids=tuple(int(t) for t in best.ids.tolist()),
+                    posterior_ids=tuple(int(t) for t in best.posterior.tolist()),
+                    committed_ids=tuple(int(t) for t in committed_ids),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()
@@ -1787,6 +1953,7 @@ class SpeculativeSession:
         target_layer_id_list = self.target_layer_id_list
         capture_layer_ids = self.capture_layer_ids
         profile_cycles = self.profile_cycles
+        capture_logits = self.capture_logits and profile_cycles
         memory_waterfall = self.memory_waterfall
         target_model = self.target_model
         draft_model = self.draft_model
@@ -1841,6 +2008,14 @@ class SpeculativeSession:
             verify_len_cap=cycle_config.verify_len_cap,
             prompt_len=request.prompt_len,
         )
+        # copyspec_mode=auto: a self-gating policy that periodically A/B-probes
+        # copyspec-on vs -off throughput, latches on/off, and signals an
+        # adaptive-policy reset on disengage (so copyspec perturbation is
+        # wiped). Only the linear/adaptive path runs it (the ddtree path maps
+        # auto -> conservative one-strike).
+        copyspec_auto_gate = (
+            CopySpecAutoGate() if self.copyspec_mode == "auto" else None
+        )
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -1864,7 +2039,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1872,6 +2047,8 @@ class SpeculativeSession:
                 forbidden_tokens=forbidden_copy_tokens,
             )
             if candidate is None:
+                return None
+            if copyspec_auto_gate is not None and not copyspec_auto_gate.engage_copy():
                 return None
             draft_backend.advance_context(
                 draft_model=draft_model,
@@ -1938,6 +2115,10 @@ class SpeculativeSession:
             drafted = None
             draft_source = "none"
             copyspec_tokens = 0
+            draft_topk_ids_arr = None
+            draft_topk_logprobs_arr = None
+            posterior_top2_ids_arr = None
+            posterior_top2_logprobs_arr = None
 
             if block_len > 1:
                 if profile_cycles:
@@ -1950,6 +2131,23 @@ class SpeculativeSession:
                     if drafted is not None:
                         draft_source = "copyspec"
                         copyspec_tokens = int(drafted.shape[0])
+                    elif capture_logits:
+                        drafted, draft_topk_ids_arr, draft_topk_logprobs_arr = (
+                            draft_backend.draft_greedy_capture(
+                                target_model=target_model,
+                                target_ops=target_ops,
+                                draft_model=draft_model,
+                                draft_cache=draft_cache,
+                                staged_first=current_staged_first,
+                                draft_context=feature_store.require_current_hidden(),
+                                block_len=block_len,
+                                mask_token_tail=mask_token_tail,
+                                suppress_token_mask=suppress_token_mask,
+                                async_launch=False,
+                                top_width=8,
+                            )
+                        )
+                        draft_source = "dflash"
                     else:
                         drafted = draft_backend.draft_greedy(
                             target_model=target_model,
@@ -2065,6 +2263,14 @@ class SpeculativeSession:
 
             acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
             posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if capture_logits:
+                posterior_top2_ids_arr, posterior_top2_logprobs_arr = (
+                    masked_topk_arrays(
+                        verify_logits[0],
+                        suppress_token_mask,
+                        width=2,
+                    )
+                )
             if not profile_cycles:
                 mx.async_eval(posterior)
             acceptance_len = int(
@@ -2079,7 +2285,15 @@ class SpeculativeSession:
                 target_layer_id_list,
             )[:, : (1 + acceptance_len), :]
             if profile_cycles:
-                mx.eval(committed_hidden, posterior)
+                if posterior_top2_ids_arr is not None:
+                    mx.eval(
+                        committed_hidden,
+                        posterior,
+                        posterior_top2_ids_arr,
+                        posterior_top2_logprobs_arr,
+                    )
+                else:
+                    mx.eval(committed_hidden, posterior)
             else:
                 mx.async_eval(committed_hidden)
             if profile_cycles:
@@ -2124,10 +2338,10 @@ class SpeculativeSession:
             if draft_source == "copyspec":
                 state.copyspec_hits += 1
                 state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-            if adaptive_block_policy is not None:
+            if adaptive_block_policy is not None or copyspec_auto_gate is not None:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
                 cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
                 adaptive_cycle_cost_ns = max(0, cycle_wall_ns - cycle_pause_ns)
@@ -2140,11 +2354,30 @@ class SpeculativeSession:
                         + commit_cycle_ns
                         + replay_cycle_ns
                     )
-                adaptive_block_policy.record(
-                    block_len=block_len,
-                    acceptance_len=acceptance_len,
-                    cycle_cost_ns=adaptive_cycle_cost_ns,
-                )
+                if copyspec_auto_gate is not None and block_len > 1:
+                    copyspec_auto_gate.record_cycle(
+                        source=("copy" if draft_source == "copyspec" else "dflash"),
+                        commit_count=commit_count,
+                        cycle_cost_ns=adaptive_cycle_cost_ns,
+                    )
+                    # On disengage the gate asks for a clean adaptive policy so
+                    # copyspec's perturbation does not drag the rest of the run.
+                    if (
+                        copyspec_auto_gate.take_reset()
+                        and adaptive_block_policy is not None
+                    ):
+                        adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
+                            runtime_config=runtime_config,
+                            effective_block_tokens=effective_block_tokens,
+                            verify_len_cap=cycle_config.verify_len_cap,
+                            prompt_len=request.prompt_len,
+                        )
+                if adaptive_block_policy is not None:
+                    adaptive_block_policy.record(
+                        block_len=block_len,
+                        acceptance_len=acceptance_len,
+                        cycle_cost_ns=adaptive_cycle_cost_ns,
+                    )
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             self.copyspec_index.append_committed(committed_ids)
             if not profile_cycles:
@@ -2275,6 +2508,29 @@ class SpeculativeSession:
                     verify_token_count=int(verify_token_count),
                     draft_source=str(draft_source),
                     candidate_count=1,
+                    proposed_ids=tuple(int(t) for t in verify_token_ids.tolist()),
+                    posterior_ids=tuple(int(t) for t in posterior.tolist()),
+                    committed_ids=tuple(int(t) for t in committed_ids),
+                    draft_topk_ids=(
+                        _capture_rows_int(draft_topk_ids_arr)
+                        if draft_topk_ids_arr is not None
+                        else None
+                    ),
+                    draft_topk_logprobs=(
+                        _capture_rows_float(draft_topk_logprobs_arr)
+                        if draft_topk_logprobs_arr is not None
+                        else None
+                    ),
+                    posterior_top2_ids=(
+                        _capture_rows_int(posterior_top2_ids_arr)
+                        if posterior_top2_ids_arr is not None
+                        else None
+                    ),
+                    posterior_top2_logprobs=(
+                        _capture_rows_float(posterior_top2_logprobs_arr)
+                        if posterior_top2_logprobs_arr is not None
+                        else None
+                    ),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()
@@ -2339,6 +2595,8 @@ class SpeculativeSession:
         yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
         state = _RequestState()
 
+        sparse_rope_saved = self._install_sparse_prefill_rope(request)
+
         try:
             prefill = yield from self._run_prefill_events(
                 request=request,
@@ -2349,6 +2607,12 @@ class SpeculativeSession:
             start_ns = prefill.start_ns
             prefill_ns = prefill.prefill_ns
             supports_prefix_snapshot = prefill.supports_prefix_snapshot
+
+            if sparse_rope_saved is not None:
+                switch_to_offset_adjusted_rope(
+                    sparse_rope_saved,
+                    decode_position_adjustment(request.prompt_token_positions),
+                )
 
             decode = yield from self._run_decode_events(
                 request=request,
@@ -2427,10 +2691,42 @@ class SpeculativeSession:
                 copyspec_hits=int(decode.copyspec_hits),
                 copyspec_tokens=int(decode.copyspec_tokens),
                 adaptive_metrics=decode.adaptive_totals or None,
+                hit_kind=request.prefix_hit_kind,
             )
             yield summary
         finally:
+            if sparse_rope_saved is not None:
+                restore_ropes(sparse_rope_saved)
+                clear_sparse_positions(
+                    self.target_ops.text_model(self.target_model)
+                )
             self.close()
+
+    def _install_sparse_prefill_rope(
+        self, request: _SessionRequest
+    ) -> Optional[list[tuple[Any, Any]]]:
+        """Install position-mapped RoPE on the target for sparse prefill.
+
+        Returns the saved (attn, original_rope) pairs for later restoration, or
+        None when this is an ordinary dense request. The draft model is wired in
+        a follow-up phase; with the target alone the output is already correct
+        (the target verifies every token) — only draft acceptance is affected.
+        """
+        positions = request.prompt_token_positions
+        if positions is None:
+            return None
+        text_model = self.target_ops.text_model(self.target_model)
+        positions_array = mx.array(positions, dtype=mx.int32)
+        # Position-dependent masks (gemma4 sliding window) read this; full-
+        # attention backends ignore it.
+        set_sparse_positions(text_model, positions_array)
+        try:
+            return install_position_mapped_rope(
+                text_model, positions_array, cache_start=0
+            )
+        except Exception:
+            clear_sparse_positions(text_model)
+            raise
 
     def close(self) -> None:
         self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)
@@ -2451,6 +2747,9 @@ class _RequestState:
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
     copyspec_disabled: bool = False
+    sidecar_boundary: int = 0
+    sidecar_gdn_states: Any = None
+    sidecar_last_logits: mx.array | None = None
 
 
 @dataclass
@@ -2470,7 +2769,7 @@ def _publish_snapshot_event(
     *,
     token_ids: list[int],
     target_cache: Any,
-    target_hidden: Optional[mx.array],
+    target_hidden: Optional[mx.array | TargetHiddenChunks],
     last_logits: Optional[mx.array],
     snapshot_service: Optional[SnapshotService],
     kind: Literal["prefill", "generation"],
@@ -2480,6 +2779,10 @@ def _publish_snapshot_event(
     from_snapshot: bool = False,
     snap_prefix_len: int = 0,
     l2_only: bool = False,
+    adopt_cache_arrays: bool = False,
+    sidecar_boundary: int = 0,
+    sidecar_gdn_states: Any = None,
+    sidecar_last_logits: Optional[mx.array] = None,
 ) -> Optional[SnapshotPublishedEvent]:
     if snapshot_service is None or target_hidden is None:
         return None
@@ -2495,6 +2798,10 @@ def _publish_snapshot_event(
         from_snapshot=from_snapshot,
         snap_prefix_len=snap_prefix_len,
         l2_only=l2_only,
+        adopt_cache_arrays=adopt_cache_arrays,
+        sidecar_boundary=sidecar_boundary,
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
     if publication is None:
         return None
@@ -2527,20 +2834,19 @@ def stream_dflash_generate_impl(
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
+    prompt_token_positions: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     prefix_snapshot: Optional[DFlashPrefixSnapshot] = None,
     snapshot_service: Optional[SnapshotService] = None,
     stable_prefix_len: Optional[int] = None,
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
+    prefix_hit_kind: str = "miss",
     runtime_context: Any,
 ) -> Iterator[EngineEvent]:
     target_capabilities = target_ops.capabilities_for(target_model)
     supports_prefix_snapshot = bool(
         getattr(target_capabilities, "supports_prefix_snapshot", True)
-    )
-    allow_full_context_draft_layers = bool(
-        getattr(target_capabilities, "supports_full_context_draft_layers", False)
     )
     prompt_tokens = (
         list(prompt_tokens_override)
@@ -2552,11 +2858,19 @@ def stream_dflash_generate_impl(
     if runtime_context is None:
         raise ValueError("runtime_context is required")
     runtime_config = runtime_context.runtime
+    _validate_draft_runtime_compatibility(draft_model, runtime_config)
     prompt_len = len(prompt_tokens)
     configured_max_ctx = int(runtime_config.dflash_max_ctx)
     dflash_max_ctx = configured_max_ctx if configured_max_ctx > 0 else sys.maxsize
     target_fa_window = int(runtime_config.target_fa_window)
     projected_ctx = prompt_len + max(0, int(max_new_tokens))
+    allow_full_context_draft_layers = resolve_full_context_draft_layers(
+        supports=bool(
+            getattr(target_capabilities, "supports_full_context_draft_layers", False)
+        ),
+        projected_ctx=projected_ctx,
+        min_ctx=int(runtime_config.draft_full_context_min_ctx),
+    )
     if projected_ctx >= dflash_max_ctx:
         fallback_reason = (
             f"projected_ctx={projected_ctx} "
@@ -2588,6 +2902,8 @@ def stream_dflash_generate_impl(
         stable_prefix_len=stable_prefix_len,
         prefix_cache_active=prefix_cache_active,
         publish_generation_snapshot=publish_generation_snapshot,
+        prefix_hit_kind=prefix_hit_kind,
+        prompt_token_positions=prompt_token_positions,
     )
 
     session = SpeculativeSession.open(
@@ -2604,4 +2920,5 @@ def stream_dflash_generate_impl(
         target_fa_window=target_fa_window,
         runtime_context=runtime_context,
     )
+    prefix_snapshot = None
     yield from session.run_events(request)

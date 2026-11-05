@@ -7,13 +7,103 @@ from __future__ import annotations
 from collections.abc import Sequence
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 
 FAState = tuple[mx.array, mx.array, int] | tuple[mx.array, mx.array, int, int]
+
+@dataclass(frozen=True)
+class TargetHiddenChunks:
+    """Sparse target-hidden spans with their logical sequence length."""
+
+    total_len: int
+    chunks: tuple[mx.array, ...]
+    spans: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.chunks:
+            raise ValueError("TargetHiddenChunks requires at least one chunk")
+        if len(self.chunks) != len(self.spans):
+            raise ValueError("TargetHiddenChunks chunks/spans length mismatch")
+        previous_end = 0
+        for chunk, (start, end) in zip(self.chunks, self.spans):
+            if start < 0 or end < start or end > int(self.total_len):
+                raise ValueError(f"Invalid target-hidden span ({start}, {end})")
+            if start < previous_end:
+                raise ValueError("Target-hidden spans must be ordered and non-overlapping")
+            if int(chunk.shape[1]) != end - start:
+                raise ValueError(
+                    f"Target-hidden chunk length {int(chunk.shape[1])} "
+                    f"!= span length {end - start}"
+                )
+            previous_end = end
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        ref = self.chunks[0]
+        return (int(ref.shape[0]), int(self.total_len), int(ref.shape[-1]))
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(chunk.nbytes) for chunk in self.chunks)
+
+    @property
+    def dtype(self) -> Any:
+        return self.chunks[0].dtype
+
+    def astype(self, dtype: Any) -> "TargetHiddenChunks":
+        if all(chunk.dtype == dtype for chunk in self.chunks):
+            return self
+        return TargetHiddenChunks(
+            total_len=int(self.total_len),
+            chunks=tuple(chunk.astype(dtype) for chunk in self.chunks),
+            spans=self.spans,
+        )
+
+    def slice(self, start: int, end: int) -> mx.array:
+        start = max(0, int(start))
+        end = min(int(self.total_len), int(end))
+        if end < start:
+            raise ValueError(f"Invalid target-hidden slice ({start}, {end})")
+        pieces: list[mx.array] = []
+        cursor = start
+        for chunk, (chunk_start, chunk_end) in zip(self.chunks, self.spans):
+            if chunk_end <= cursor:
+                continue
+            if chunk_start > cursor:
+                break
+            copy_end = min(end, chunk_end)
+            if copy_end > cursor:
+                offset = cursor - chunk_start
+                pieces.append(chunk[:, offset : offset + copy_end - cursor, :])
+                cursor = copy_end
+            if cursor >= end:
+                break
+        if cursor != end:
+            raise ValueError(
+                f"Target-hidden spans do not cover requested slice ({start}, {end})"
+            )
+        if not pieces:
+            ref = self.chunks[0]
+            return mx.zeros(
+                (int(ref.shape[0]), 0, int(ref.shape[-1])),
+                dtype=ref.dtype,
+            )
+        return pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=1)
+
+    def materialize(self) -> mx.array:
+        ref = self.chunks[0]
+        result = mx.zeros(
+            (int(ref.shape[0]), int(self.total_len), int(ref.shape[-1])),
+            dtype=ref.dtype,
+        )
+        for chunk, (start, end) in zip(self.chunks, self.spans):
+            result[:, start:end, :] = chunk
+        mx.eval(result)
+        return result
 
 @dataclass
 class DFlashPrefixSnapshot:
@@ -27,6 +117,11 @@ class DFlashPrefixSnapshot:
     key: DFlashPrefixKey
     kind: str = "prefill"
     created_at: float = field(default_factory=time.time)
+    sidecar_boundary: int = 0
+    sidecar_gdn_states: Optional[
+        tuple[Optional[tuple[Optional[mx.array], ...]], ...]
+    ] = None
+    sidecar_last_logits: Optional[mx.array] = None
 
     @property
     def prefix_len(self) -> int:
@@ -50,11 +145,21 @@ class DFlashPrefixSnapshot:
                 for a in gdn:
                     if a is not None:
                         gdn_bytes += int(a.nbytes)
+        sidecar_bytes = 0
+        if self.sidecar_gdn_states is not None:
+            for gdn in self.sidecar_gdn_states:
+                if gdn is not None:
+                    for a in gdn:
+                        if a is not None:
+                            sidecar_bytes += int(a.nbytes)
+        if self.sidecar_last_logits is not None:
+            sidecar_bytes += int(self.sidecar_last_logits.nbytes)
         return {
             "fa_kv": fa_bytes,
             "gdn_state": gdn_bytes,
             "draft_context": draft_context_bytes,
             "last_logits": last_logits_bytes,
+            "sidecar": sidecar_bytes,
         }
 
 def validate_prefix_snapshot(

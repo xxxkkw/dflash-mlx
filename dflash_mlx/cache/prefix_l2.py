@@ -25,6 +25,7 @@ import mlx.core as mx
 import dflash_mlx
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.engine.prefill import snapshot_covers_prefix, spans_cover_prefix
 
 _LOG = logging.getLogger(__name__)
 
@@ -147,6 +148,12 @@ def _fingerprint(snapshot: DFlashPrefixSnapshot) -> str:
         "runtime": dflash_mlx.__version__,
         "context_representation": CONTEXT_REPRESENTATION,
     }
+    if int(snapshot.sidecar_boundary) > 0:
+        payload["sidecar_boundary"] = int(snapshot.sidecar_boundary)
+    # Mark only full coverage so a full twin of a trimmed file gets a
+    # distinct filename the exists-check cannot shadow.
+    if snapshot_covers_prefix(snapshot, snapshot.prefix_len):
+        payload["full_coverage"] = True
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
@@ -228,15 +235,45 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
                     mask.append(True)
             gdn_array_present.append(mask)
 
+    if len(snapshot.target_hidden_chunks) != len(snapshot.target_hidden_chunk_spans):
+        raise ValueError("target-hidden chunks/spans length mismatch")
     chunk_spans: list[list[int]] = []
-    for c, chunk in enumerate(snapshot.target_hidden_chunks):
-        arrays[f"target_hidden_{c}"] = chunk
-    for span in snapshot.target_hidden_chunk_spans:
+    for chunk, span in zip(
+        snapshot.target_hidden_chunks, snapshot.target_hidden_chunk_spans
+    ):
+        start, end = int(span[0]), int(span[1])
+        if 0 in chunk.shape or end <= start or int(chunk.shape[1]) != end - start:
+            raise ValueError(f"invalid target-hidden chunk for span ({start}, {end})")
+        arrays[f"target_hidden_{len(chunk_spans)}"] = chunk
         chunk_spans.append([int(span[0]), int(span[1])])
 
     has_last_logits = snapshot.last_logits is not None
     if has_last_logits:
         arrays["last_logits"] = snapshot.last_logits
+
+    sidecar_boundary = int(snapshot.sidecar_boundary)
+    sidecar_gdn_present: list[bool] = []
+    sidecar_gdn_arity: list[int] = []
+    sidecar_gdn_array_present: list[list[bool]] = []
+    if sidecar_boundary > 0 and snapshot.sidecar_gdn_states is not None:
+        for i, gdn in enumerate(snapshot.sidecar_gdn_states):
+            if gdn is None:
+                sidecar_gdn_present.append(False)
+                sidecar_gdn_arity.append(0)
+                sidecar_gdn_array_present.append([])
+            else:
+                sidecar_gdn_present.append(True)
+                sidecar_gdn_arity.append(len(gdn))
+                mask = []
+                for j, a in enumerate(gdn):
+                    if a is None:
+                        mask.append(False)
+                    else:
+                        arrays[f"sidecar_gdn_{i}_{j}"] = a
+                        mask.append(True)
+                sidecar_gdn_array_present.append(mask)
+        if snapshot.sidecar_last_logits is not None:
+            arrays["sidecar_last_logits"] = snapshot.sidecar_last_logits
 
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
@@ -255,6 +292,10 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
         "target_hidden_chunk_spans": chunk_spans,
         "target_hidden_total_len": int(snapshot.target_hidden_total_len),
         "has_last_logits": has_last_logits,
+        "sidecar_boundary": sidecar_boundary,
+        "sidecar_gdn_present": sidecar_gdn_present,
+        "sidecar_gdn_arity": sidecar_gdn_arity,
+        "sidecar_gdn_array_present": sidecar_gdn_array_present,
     }
     metadata_dict = {"dflash_meta": json.dumps(meta, separators=(",", ":"))}
     return arrays, metadata_dict
@@ -310,6 +351,30 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
     if meta.get("has_last_logits"):
         last_logits = arrays["last_logits"]
 
+    sidecar_boundary = int(meta.get("sidecar_boundary", 0) or 0)
+    sidecar_gdn_states = None
+    sidecar_last_logits = None
+    if sidecar_boundary > 0:
+        sidecar_present = meta.get("sidecar_gdn_present", [])
+        sidecar_arity = meta.get("sidecar_gdn_arity", [])
+        sidecar_mask = meta.get("sidecar_gdn_array_present", [])
+        states: list[Optional[tuple[Optional[mx.array], ...]]] = []
+        for i, present in enumerate(sidecar_present):
+            if not present:
+                states.append(None)
+            else:
+                arity = int(sidecar_arity[i])
+                mask = sidecar_mask[i]
+                sub: list[Optional[mx.array]] = []
+                for j in range(arity):
+                    if j < len(mask) and mask[j]:
+                        sub.append(arrays[f"sidecar_gdn_{i}_{j}"])
+                    else:
+                        sub.append(None)
+                states.append(tuple(sub))
+        sidecar_gdn_states = tuple(states)
+        sidecar_last_logits = arrays.get("sidecar_last_logits")
+
     _eval_arrays(arrays)
 
     return DFlashPrefixSnapshot(
@@ -325,11 +390,23 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
         key=key,
         kind=str(meta["kind"]),
         created_at=float(meta.get("created_at", time.time())),
+        sidecar_boundary=sidecar_boundary,
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
 
 @dataclass
 class _WritePayload:
     tmp_path: Optional[Path]
+    final_path: Path
+    nbytes: int
+    epoch: int
+
+@dataclass(frozen=True)
+class _WriteJob:
+    """Holds pre-eval'd arrays ready for disk write. Created on the request thread."""
+    arrays_mlx: dict
+    meta: dict
     final_path: Path
     nbytes: int
     epoch: int
@@ -350,7 +427,7 @@ class DFlashPrefixL2Cache:
         self._lock = threading.Lock()
 
         self._writer_slots = threading.Semaphore(self._max_in_flight)
-        self._write_queue: Queue[Optional[_WritePayload]] = Queue()
+        self._write_queue: Queue[Optional[_WriteJob]] = Queue()
         self._epoch = 0
 
         self._tracked_disk_bytes = 0
@@ -370,8 +447,13 @@ class DFlashPrefixL2Cache:
             "load_total_us": 0,
             "lookup_loads": 0,
             "lookup_hash_filtered": 0,
+            "coverage_rejects": 0,
         }
         self._stop = threading.Event()
+        self._write_gate = threading.Event()
+        self._write_gate.set()
+        self._gate_lock = threading.Lock()
+        self._active_requests = 0
         self._lock_fp = self._try_acquire_dir_lock()
 
         self._tracked_disk_bytes = self._snapshot_disk_bytes()
@@ -430,6 +512,7 @@ class DFlashPrefixL2Cache:
         key: DFlashPrefixKey,
         *,
         min_token_len: int = 0,
+        require_full_coverage: bool = False,
     ) -> Optional[DFlashPrefixSnapshot]:
         t0 = time.perf_counter_ns()
         req_tokens = tuple(int(t) for t in req_tokens)
@@ -470,7 +553,11 @@ class DFlashPrefixL2Cache:
             with self._lock:
                 self._stats["lookup_loads"] += 1
             snap = self._load_and_validate(
-                path, key=key, req_tokens=req_tokens, parts=parts
+                path,
+                key=key,
+                req_tokens=req_tokens,
+                parts=parts,
+                require_full_coverage=require_full_coverage,
             )
             if snap is None:
                 continue
@@ -482,6 +569,10 @@ class DFlashPrefixL2Cache:
                 self._stats["hits"] += 1
                 self._stats["bytes_out"] += snap.nbytes
                 self._stats["load_total_us"] += int(elapsed_us)
+            try:
+                os.utime(path)
+            except OSError:
+                pass
             return snap
 
         with self._lock:
@@ -501,23 +592,20 @@ class DFlashPrefixL2Cache:
                 self._stats["write_drops_queue_full"] += 1
             return False
         try:
-            payload = self._prepare_payload(snapshot)
-        except OSError as e:
-            if e.errno in (errno.ENOSPC, errno.EDQUOT):
-                _LOG.warning("L2 write skipped (disk full): %s", e)
-                with self._lock:
-                    self._stats["write_errors"] += 1
-            else:
-                _LOG.warning("L2 materialize failed: %s", e)
-                with self._lock:
-                    self._stats["materialize_errors"] += 1
-            self._writer_slots.release()
-            return False
+            arrays_mlx, meta = _serialize(snapshot)
+            _eval_arrays(arrays_mlx)
         except Exception:
             self._writer_slots.release()
             raise
-
-        self._write_queue.put(payload)
+        with self._lock:
+            epoch = self._epoch
+        self._write_queue.put(_WriteJob(
+            arrays_mlx=arrays_mlx,
+            meta=meta,
+            final_path=final_path,
+            nbytes=int(snapshot.nbytes),
+            epoch=epoch,
+        ))
         return True
 
     def stats(self) -> dict[str, Any]:
@@ -529,7 +617,19 @@ class DFlashPrefixL2Cache:
         out["current_bytes"] = current_bytes
         return out
 
+    def begin_request(self) -> None:
+        with self._gate_lock:
+            self._active_requests += 1
+            self._write_gate.clear()
+
+    def end_request(self) -> None:
+        with self._gate_lock:
+            self._active_requests = max(0, self._active_requests - 1)
+            if self._active_requests == 0:
+                self._write_gate.set()
+
     def shutdown(self, wait: bool = True) -> None:
+        self._write_gate.set()
         if self._writer_thread is not None:
 
             self._write_queue.put(None)
@@ -553,48 +653,62 @@ class DFlashPrefixL2Cache:
     def _writer_loop(self) -> None:
         while True:
             try:
-                payload = self._write_queue.get(timeout=0.5)
+                job = self._write_queue.get(timeout=0.5)
             except Empty:
                 if self._stop.is_set():
                     break
                 continue
-            if payload is None:
+            if job is None:
                 break
             try:
-                self._write_payload(payload)
-            except Exception as e:
-                _LOG.warning("L2 write failed: %s", e)
+                while not self._write_gate.wait(timeout=0.5):
+                    if self._stop.is_set():
+                        break
                 with self._lock:
-                    self._stats["write_errors"] += 1
+                    if job.epoch != self._epoch:
+                        self._stats["write_drops_epoch_invalidated"] += 1
+                        continue
+                try:
+                    payload = self._write_job_to_disk(job)
+                except OSError as e:
+                    if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                        _LOG.warning("L2 write skipped (disk full): %s", e)
+                        with self._lock:
+                            self._stats["write_errors"] += 1
+                    else:
+                        _LOG.warning("L2 materialize failed: %s", e)
+                        with self._lock:
+                            self._stats["materialize_errors"] += 1
+                    continue
+                try:
+                    self._write_payload(payload)
+                except Exception as e:
+                    _LOG.warning("L2 write failed: %s", e)
+                    with self._lock:
+                        self._stats["write_errors"] += 1
             finally:
-
-                payload = None
+                job = None
                 self._writer_slots.release()
 
-    def _prepare_payload(self, snapshot: DFlashPrefixSnapshot) -> _WritePayload:
-        arrays_mlx, meta = _serialize(snapshot)
-        _eval_arrays(arrays_mlx)
-        final_path = self._final_path_for(snapshot)
-        with self._lock:
-            epoch = self._epoch
-        if final_path.exists():
+    def _write_job_to_disk(self, job: _WriteJob) -> _WritePayload:
+        """Write pre-eval'd arrays to a temp file. Called from the writer thread."""
+        if job.final_path.exists():
             return _WritePayload(
                 tmp_path=None,
-                final_path=final_path,
-                nbytes=int(snapshot.nbytes),
-                epoch=int(epoch),
+                final_path=job.final_path,
+                nbytes=job.nbytes,
+                epoch=job.epoch,
             )
-
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        job.final_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{final_path.stem}.",
+            prefix=f".{job.final_path.stem}.",
             suffix=L2_TMP_SUFFIX,
-            dir=str(final_path.parent),
+            dir=str(job.final_path.parent),
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
         try:
-            mx.save_safetensors(str(tmp_path), arrays_mlx, metadata=meta)
+            mx.save_safetensors(str(tmp_path), job.arrays_mlx, metadata=job.meta)
         except Exception:
             try:
                 tmp_path.unlink()
@@ -603,9 +717,9 @@ class DFlashPrefixL2Cache:
             raise
         return _WritePayload(
             tmp_path=tmp_path,
-            final_path=final_path,
-            nbytes=int(snapshot.nbytes),
-            epoch=int(epoch),
+            final_path=job.final_path,
+            nbytes=job.nbytes,
+            epoch=job.epoch,
         )
 
     def _write_payload(self, payload: _WritePayload) -> None:
@@ -679,6 +793,7 @@ class DFlashPrefixL2Cache:
         key: DFlashPrefixKey,
         req_tokens: tuple[int, ...],
         parts: _Parts,
+        require_full_coverage: bool = False,
     ) -> Optional[DFlashPrefixSnapshot]:
         try:
             arrays, metadata = mx.load(
@@ -770,6 +885,24 @@ class DFlashPrefixL2Cache:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
             return None
+        if require_full_coverage:
+            spans_raw = meta.get("target_hidden_chunk_spans")
+            if not isinstance(spans_raw, list) or not all(
+                isinstance(span, list)
+                and len(span) == 2
+                and all(_is_json_int(v) for v in span)
+                for span in spans_raw
+            ):
+                with self._lock:
+                    self._stats["schema_rejects"] += 1
+                self._unlink_if_writable(path)
+                return None
+            if not spans_cover_prefix(
+                ((int(s), int(e)) for s, e in spans_raw), n
+            ):
+                with self._lock:
+                    self._stats["coverage_rejects"] += 1
+                return None
         try:
             return _deserialize(arrays, meta)
         except Exception as e:
